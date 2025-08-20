@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"flag"
 	"fmt"
 	"math/rand/v2"
 	"net/http"
+	"os"
 	"slices"
+	"strings"
 
 	"github.com/luthermonson/go-proxmox"
 )
@@ -14,10 +17,10 @@ import (
 const (
 	VMID_RANGE_LOWER = 1250
 	VMID_RANGE_UPPER = 1300
+	VM_TAG           = "zagato-k3s-auto"
 )
 
 func printNodes(nodeStatuses []*proxmox.NodeStatus) {
-	fmt.Print("hello!!!\n")
 	for _, status := range nodeStatuses {
 		fmt.Printf("Node: %s, Status: %s,  Uptime: %d\n",
 			status.Node,
@@ -27,12 +30,12 @@ func printNodes(nodeStatuses []*proxmox.NodeStatus) {
 	}
 }
 
-func generateNewVMID(vmids []uint64) uint64 {
+func generateNewVMID(vmids []uint64) int {
 	// TODO: This potentially can infinite loop due to VMID exhaustion
 	for {
 		vmid := rand.Uint64N(VMID_RANGE_UPPER-VMID_RANGE_LOWER) + VMID_RANGE_LOWER
 		if !slices.Contains(vmids, vmid) {
-			return vmid
+			return int(vmid)
 		}
 	}
 }
@@ -46,7 +49,21 @@ func generateNewVMID(vmids []uint64) uint64 {
 // 	return nil, fmt.Errorf("node with name %q not found", targetName)
 // }
 
-func createVM(client proxmox.Client) {
+func generateRandomMAC() string {
+	b := [6]byte{
+		byte(rand.Uint32N(256)),
+		byte(rand.Uint32N(256)),
+		byte(rand.Uint32N(256)),
+		byte(rand.Uint32N(256)),
+		byte(rand.Uint32N(256)),
+		byte(rand.Uint32N(256)),
+	}
+	b[0] &^= 0x01 // ensure unicast
+	b[0] |= 0x02  // locally administered
+	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4], b[5])
+}
+
+func createVM(client proxmox.Client, nodeName string) {
 	ctx := context.Background()
 
 	// Steps:
@@ -79,14 +96,13 @@ func createVM(client proxmox.Client) {
 		vmids = append(vmids, resource.VMID)
 	}
 
-	// newVMID := generateNewVMID(vmids)
-	newVMID := 1256
+	newVMID := generateNewVMID(vmids)
 
 	fmt.Printf("New VMID: %d\n", newVMID)
 
 	// Create the VM on Alfaromeo
 	// node, err := getNodeByName(nodeStatuses, "alfaromeo")
-	node, err := client.Node(context.Background(), "alfaromeo")
+	node, err := client.Node(context.Background(), nodeName)
 	if err != nil {
 		fmt.Printf("Error getting node: %v\n", err)
 		panic(err)
@@ -109,11 +125,12 @@ func createVM(client proxmox.Client) {
 		{Name: "cpu", Value: "host"},
 		{Name: "memory", Value: 4096},
 		{Name: "boot", Value: "order=net0"},
-		{Name: "net0", Value: "virtio=AC:E1:AF:9D:E2:E2,bridge=vmbr0,tag=20"},
+		{Name: "net0", Value: fmt.Sprintf("virtio=%s,bridge=vmbr0,tag=20", generateRandomMAC())},
 		{Name: "ostype", Value: "l26"},
 		{Name: "cicustom", Value: "meta=snippets:snippets/zagato-shared-cloud-init-meta-data.yaml"},
 		{Name: "ipconfig0", Value: "ip=dhcp"},
 		{Name: "ide2", Value: "local-zfs:cloudinit"},
+		{Name: "tags", Value: VM_TAG},
 		// {Name: "", Value: },
 		// {Name: "", Value: },
 		// {Name: "", Value: },
@@ -132,7 +149,7 @@ func createVM(client proxmox.Client) {
 	}
 
 	// 6) Power on
-	vm, err := node.VirtualMachine(ctx, int(newVMID))
+	vm, err := node.VirtualMachine(ctx, newVMID)
 	if err != nil {
 		panic(err)
 	}
@@ -141,7 +158,72 @@ func createVM(client proxmox.Client) {
 	}
 }
 
+func deleteVM(client proxmox.Client, nodeName string, vmid int) {
+	ctx := context.Background()
+
+	node, err := client.Node(context.Background(), nodeName)
+	if err != nil {
+		fmt.Printf("Error getting node: %v\n", err)
+		panic(err)
+	}
+
+	vm, err := node.VirtualMachine(ctx, vmid)
+	if err != nil {
+		panic(err)
+	}
+	if !strings.Contains(vm.Tags, VM_TAG) {
+		err := fmt.Errorf("refusing to delete targeted VMID %d in node %s because it does not have required tag", vmid, nodeName)
+		panic(err)
+	}
+
+	stopVMTask, err := vm.Stop(ctx)
+	if err != nil {
+		fmt.Printf("Error Stopping VM: %v\n", err)
+		panic(err)
+	}
+
+	if err := stopVMTask.WaitFor(ctx, 600); err != nil {
+		panic(err)
+	}
+
+	deleteVMTask, err := vm.Delete(ctx)
+	if err != nil {
+		fmt.Printf("Error Deleting VM: %v\n", err)
+		panic(err)
+	}
+
+	if err := deleteVMTask.WaitFor(ctx, 600); err != nil {
+		panic(err)
+	}
+}
+
+func printUsage() {
+	fmt.Println(`Usage:
+  proxctl <command> [options]
+
+Commands:
+  create        Create a VM
+  delete        Delete a VM
+
+Global environment:
+  PROXMOX_SECRET   API token secret (required)
+
+Subcommand options:
+  create:
+    --node <name>   Proxmox node (default "alfaromeo")
+
+  delete:
+    --node <name>   Proxmox node (default "alfaromeo")
+    --vmid <id>     VMID to delete (required)`)
+}
+
 func main() {
+	if len(os.Args) < 2 {
+		printUsage()
+		os.Exit(2)
+	}
+
+	// Shared client setup
 	insecureHTTPClient := http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
@@ -150,19 +232,50 @@ func main() {
 		},
 	}
 	tokenID := "root@pam!erik-dev-key"
-	secret := "9420db92-429f-4422-9c2f-d41b3d711b51"
-
+	secret := os.Getenv("PROXMOX_SECRET")
+	if secret == "" {
+		fmt.Fprintln(os.Stderr, "error: PROXMOX_SECRET environment variable not set")
+		os.Exit(1)
+	}
 	client := proxmox.NewClient("https://100.64.0.25:8006/api2/json",
 		proxmox.WithHTTPClient(&insecureHTTPClient),
 		proxmox.WithAPIToken(tokenID, secret),
 	)
 
+	// Print Proxmox version once for visibility
 	version, err := client.Version(context.Background())
 	if err != nil {
-		panic(err)
+		fmt.Fprintln(os.Stderr, "version error:", err)
+		os.Exit(1)
 	}
-	fmt.Println(version.Release) // 6.3
+	fmt.Println(version.Release)
 
-	createVM(*client)
+	switch os.Args[1] {
+	case "create":
+		createFlags := flag.NewFlagSet("create", flag.ExitOnError)
+		node := createFlags.String("node", "alfaromeo", "Proxmox node")
+		_ = createFlags.Parse(os.Args[2:])
 
+		createVM(*client, *node)
+
+	case "delete":
+		deleteFlags := flag.NewFlagSet("delete", flag.ExitOnError)
+		node := deleteFlags.String("node", "alfaromeo", "Proxmox node")
+		vmid := deleteFlags.Int("vmid", -1, "VMID to delete (required)")
+		_ = deleteFlags.Parse(os.Args[2:])
+
+		if *vmid <= 0 {
+			fmt.Fprintln(os.Stderr, "error: --vmid is required and must be > 0")
+			deleteFlags.Usage()
+			os.Exit(2)
+		}
+		deleteVM(*client, *node, *vmid)
+
+	case "help", "-h", "--help":
+		printUsage()
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command: %q\n\n", os.Args[1])
+		printUsage()
+		os.Exit(2)
+	}
 }
