@@ -18,6 +18,7 @@ const (
 	VMID_RANGE_LOWER = 1250
 	VMID_RANGE_UPPER = 1300
 	VM_TAG           = "zagato-k3s-auto"
+	VM_NAME_PREFIX   = "zagato-worker-auto"
 )
 
 func printNodes(nodeStatuses []*proxmox.NodeStatus) {
@@ -119,7 +120,7 @@ func createVM(client proxmox.Client, nodeName string) {
 	// fmt.Printf("VM: %+v\n", vm.VirtualMachineConfig)
 
 	opts := []proxmox.VirtualMachineOption{
-		{Name: "name", Value: "golang-test"},
+		{Name: "name", Value: fmt.Sprintf("%s-%d", VM_NAME_PREFIX, newVMID)},
 		{Name: "sockets", Value: 1},
 		{Name: "cores", Value: 4},
 		{Name: "cpu", Value: "host"},
