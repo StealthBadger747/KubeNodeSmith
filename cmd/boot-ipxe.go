@@ -131,6 +131,7 @@ func createVM(client proxmox.Client, nodeName string) {
 		{Name: "cicustom", Value: "meta=snippets:snippets/zagato-shared-cloud-init-meta-data.yaml"},
 		{Name: "ipconfig0", Value: "ip=dhcp"},
 		{Name: "ide2", Value: "local-zfs:cloudinit"},
+		{Name: "scsi0", Value: "local-zfs:16"},
 		{Name: "tags", Value: VM_TAG},
 		// {Name: "", Value: },
 		// {Name: "", Value: },
