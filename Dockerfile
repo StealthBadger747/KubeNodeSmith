@@ -17,4 +17,4 @@ FROM gcr.io/distroless/base-debian12:nonroot
 
 COPY --from=builder /out/proxctl /usr/local/bin/proxctl
 
-ENTRYPOINT ["/usr/local/bin/proxctl"]
+ENTRYPOINT ["/usr/local/bin/proxctl", "auto"]
