@@ -12,16 +12,7 @@ env:
 
 jobs:
   build:
-    strategy:
-      matrix:
-        include:
-          - arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-24.04
-          - arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-24.04
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
 
@@ -47,13 +38,13 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build ${{ matrix.platform }}
+      - name: Build linux/amd64
         id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
-          platforms: ${{ matrix.platform }}
+          platforms: linux/amd64
           cache-from: type=gha
           cache-to: type=gha,mode=max
           labels: ${{ steps.meta.outputs.labels }}
@@ -66,7 +57,7 @@ jobs:
       - name: Upload digest artifact
         uses: actions/upload-artifact@v4
         with:
-          name: digest-${{ matrix.arch }}
+          name: digest-amd64
           path: digest.txt
 
   manifest:
@@ -86,16 +77,15 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Download digests
+      - name: Download digest
         uses: actions/download-artifact@v4
         with:
+          name: digest-amd64
           path: digests
 
-      - name: Extract digests
-        id: digests
-        run: |
-          echo "amd64=$(cat digests/digest-amd64/digest.txt)" >> "$GITHUB_OUTPUT"
-          echo "arm64=$(cat digests/digest-arm64/digest.txt)" >> "$GITHUB_OUTPUT"
+      - name: Extract digest
+        id: digest
+        run: echo "value=$(cat digests/digest.txt)" >> "$GITHUB_OUTPUT"
 
       - name: Generate tags
         id: meta
@@ -107,7 +97,7 @@ jobs:
             type=ref,event=tag
             type=sha
 
-      - name: Create multi-arch manifest
+      - name: Create manifest
         run: |
           TAG_ARGS=()
           while IFS= read -r tag; do
@@ -118,5 +108,6 @@ jobs:
 
           docker buildx imagetools create \
             "${TAG_ARGS[@]}" \
-            $IMAGE_NAME@${{ steps.digests.outputs.amd64 }} \
-            $IMAGE_NAME@${{ steps.digests.outputs.arm64 }}
+            $IMAGE_NAME@${{ steps.digest.outputs.value }}
+
+          docker buildx imagetools inspect $IMAGE_NAME@${{ steps.digest.outputs.value }}
