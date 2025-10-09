@@ -17,3 +17,9 @@ spec:
       containers:
       - name: kubenodesmith
         image: stealthbadger747/kubenodesmith:main
+        env:
+          - name: PROXMOX_SECRET
+            valueFrom:
+              secretKeyRef:
+                name: proxmox-api-secret
+                key: PROXMOX_SECRET
