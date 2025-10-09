@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: kubenodesmith-deployment
+  namespace: kubenodesmith
   labels:
     app: kubenodesmith
 spec:
@@ -18,8 +19,8 @@ spec:
       - name: kubenodesmith
         image: stealthbadger747/kubenodesmith:main
         env:
-          - name: PROXMOX_SECRET
-            valueFrom:
-              secretKeyRef:
-                name: proxmox-api-secret
-                key: PROXMOX_SECRET
+        - name: PROXMOX_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: proxmox-api-secret
+              key: PROXMOX_SECRET

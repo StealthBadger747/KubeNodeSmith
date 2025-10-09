@@ -11,7 +11,7 @@ spec:
     path: manifests/app
   destination:
     server: https://kubernetes.default.svc
-    namespace: default
+    namespace: kubenodesmith
   syncPolicy:
     automated:
       prune: true
