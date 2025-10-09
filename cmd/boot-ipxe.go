@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"math"
@@ -171,6 +172,26 @@ func createVM(client proxmox.Client, nodeName string, cpu int64, memMiB int64) (
 	return nodeName, newVMID
 }
 
+func startHealthServer() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	server := &http.Server{
+		Addr:              ":8080",
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			fmt.Fprintf(os.Stderr, "health server error: %v\n", err)
+		}
+	}()
+}
+
 func deleteVM(client proxmox.Client, proxNodeName string, vmid int) {
 	ctx := context.Background()
 	kubeNodeName := fmt.Sprintf("%s-%d", VM_NAME_PREFIX, vmid)
@@ -307,6 +328,7 @@ func main() {
 	case "auto":
 		ctx := context.Background()
 		cs := kube.GetClientset()
+		startHealthServer()
 
 		for {
 			pods, err := kube.GetUnschedulablePods(ctx, cs)

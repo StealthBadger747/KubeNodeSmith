@@ -1,3 +1,4 @@
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -25,6 +26,21 @@ spec:
             secretKeyRef:
               name: proxmox-api-secret
               key: PROXMOX_SECRET
+        ports:
+          - name: http-health
+            containerPort: 8080
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: http-health
+          initialDelaySeconds: 5
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: http-health
+          initialDelaySeconds: 2
+          periodSeconds: 10
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -42,3 +58,51 @@ spec:
         - key: node-role.kubernetes.io/master
           operator: Exists 
           effect: NoSchedule
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubenodesmith
+  namespace: kubenodesmith
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubenodesmith
+rules:
+- apiGroups: [""]
+  resources: ["pods/eviction"]
+  verbs: ["create"]
+# Needed to list pods by Node
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+# Needed to cordon Nodes
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "patch", "list", "update", "delete"]
+# Needed to determine Pod owners
+- apiGroups: ["apps"]
+  resources: ["statefulsets"]
+  verbs: ["get", "list"]
+# Needed to determine Pod owners
+- apiGroups: ["extensions"]
+  resources: ["daemonsets", "replicasets"]
+  verbs: ["get", "list"]
+- apiGroups: ["storage.k8s.io"]
+  resources: ["volumeattachments"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubenodesmith
+subjects:
+- kind: ServiceAccount
+  name: kubenodesmith
+  apiGroup: ""
+  namespace: kubenodesmith
+roleRef:
+  kind: ClusterRole
+  name: kubenodesmith
+  apiGroup: ""
