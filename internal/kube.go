@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 )
@@ -35,10 +37,25 @@ func initKubeconfigFlag() {
 func GetClientset() *kubernetes.Clientset {
 	kubeconfigOnce.Do(initKubeconfigFlag)
 
-	// use the current context in kubeconfig
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
-	if err != nil {
-		panic(err.Error())
+	var (
+		config *rest.Config
+		err    error
+	)
+
+	if kubeconfigPath != "" {
+		if _, statErr := os.Stat(kubeconfigPath); statErr == nil {
+			config, err = clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+			if err != nil {
+				panic(fmt.Errorf("failed to load kubeconfig %s: %w", kubeconfigPath, err))
+			}
+		}
+	}
+
+	if config == nil {
+		config, err = rest.InClusterConfig()
+		if err != nil {
+			panic(fmt.Errorf("failed to create in-cluster config: %w", err))
+		}
 	}
 
 	// create the clientset
