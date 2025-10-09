@@ -1,14 +1,14 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: KubeNodeSmith
+  name: kube-node-smith
   namespace: argocd
 spec:
   project: default
   source:
     repoURL: https://github.com/StealthBadger747/KubeNodeSmith.git
     targetRevision: main
-    path: manifests
+    path: manifests/app
   destination:
     server: https://kubernetes.default.svc
     namespace: default

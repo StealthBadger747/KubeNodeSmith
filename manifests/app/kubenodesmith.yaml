@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubenodesmith-deployment
+  labels:
+    app: kubenodesmith
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubenodesmith
+  template:
+    metadata:
+      labels:
+        app: kubenodesmith
+    spec:
+      containers:
+      - name: kubenodesmith
+        image: stealthbadger747/kubenodesmith:main
