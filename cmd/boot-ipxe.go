@@ -271,7 +271,7 @@ Subcommand options:
     --vmid <id>     VMID to delete (required)`)
 }
 
-func main() {
+func old_main() {
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(2)

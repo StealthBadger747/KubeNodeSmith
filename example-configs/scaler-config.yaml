@@ -1,70 +1,95 @@
-apiVersion: autoscaler.stealth.dev/v1alpha1
-kind: ScalerConfig
-metadata:
-  name: kubenodesmith
-spec:
-  pollingInterval: 30s
+schemaVersion: v1alpha1
 
-  providers:
-    proxmox-production:
-      type: proxmox
+pollingInterval: 30s
+
+providers:
+  proxmox-production:
+    type: proxmox
+    credentialsRef:
+      name: proxmox-api-secret
+      namespace: kubenodesmith
+    options:
       endpoint: https://100.64.0.25:8006/api2/json
-      defaultNode: alfaromeo
-      credentialsRef:
-        name: proxmox-api-secret
-        namespace: kubenodesmith
-      bootstrap:
-        cloudInitSnippets:
-          - snippets/zagato-shared-cloud-init-meta-data.yaml
+      nodeWhitelist:
+        - alfaromeo
+        - porsche
+      vmIDRange:
+        lower: 1250
+        upper: 1300
+      vmMemOverheadMiB: 2046
+      vmTags:
+        - zagato-k3s-auto
+      networkInterfaces:
+        - name: net0
+          model: virtio
+          bridge: vmbr0
+          vlanTag: 20
+          macPrefix: "02:00:00"
+      vmOptions:
+        - name: sockets
+          value: 1
+        - name: cpu
+          value: host
+        - name: boot
+          value: order=net0
+        - name: ostype
+          value: l26
+        - name: ipconfig0
+          value: ip=dhcp
+        - name: ide2
+          value: local-zfs:cloudinit
+        - name: scsi0
+          value: local-zfs:16
+        - name: cicustom
+          value: meta=snippets:snippets/zagato-shared-cloud-init-meta-data.yaml
 
-    baremetal-lab:
-      type: redfish
+  baremetal-lab:
+    type: redfish
+    credentialsRef:
+      name: redfish-secret
+      namespace: kubenodesmith
+    options:
       bmcAddresses:
         - 10.0.10.11
         - 10.0.10.12
-      credentialsRef:
-        name: redfish-secret
-        namespace: kubenodesmith
 
-  nodePools:
-    - name: proxmox-small
-      providerRef: proxmox-production
-      limits:
-        minNodes: 0
-        maxNodes: 5
-      machineTemplate:
-        kubeNodeNamePrefix: zagato-worker-auto
-        cpuCores: 4
-        memoryMiB: 6144
-        diskGiB: 40
-        architecture: amd64
-        tags:
-          provider-tag: zagato-k3s-auto
-        labels:
-          node-role.kubernetes.io/worker: ""
-          topology.kubenodesmith.io/pool: proxmox-small
-      scaleUp:
-        batchSize: 1
-        stabilizationWindow: 2m
-      scaleDown:
-        maxConcurrent: 1
-        drainTimeout: 10m
+nodePools:
+  - name: proxmox-small
+    providerRef: proxmox-production
+    limits:
+      minNodes: 0
+      maxNodes: 5
+    machineTemplate:
+      kubeNodeNamePrefix: zagato-worker-auto
+      cpuCores: 4
+      memoryMiB: 6144
+      diskGiB: 40
+      architecture: amd64
+      labels:
+        node-role.kubernetes.io/worker: ""
+        topology.kubenodesmith.io/pool: proxmox-small
+    scaleUp:
+      batchSize: 1
+      stabilizationWindow: 2m
+    scaleDown:
+      maxConcurrent: 1
+      drainTimeout: 10m
 
-    - name: baremetal-test
-      providerRef: baremetal-lab
-      limits:
-        minNodes: 0
-        maxNodes: 2
-      machineTemplate:
-        kubeNodeNamePrefix: zagato-worker-bm
-        cpuCores: 8
-        memoryMiB: 16384
-        diskGiB: 80
-        architecture: amd64
-        labels:
-          node-role.kubernetes.io/worker: ""
-          topology.kubenodesmith.io/pool: baremetal-test
-      scaleUp:
-        batchSize: 1
-      scaleDown:
-        maxConcurrent: 1
+  - name: baremetal-test
+    providerRef: baremetal-lab
+    limits:
+      minNodes: 0
+      maxNodes: 2
+    machineTemplate:
+      kubeNodeNamePrefix: zagato-worker-bm
+      cpuCores: 8
+      memoryMiB: 16384
+      diskGiB: 80
+      architecture: amd64
+      labels:
+        node-role.kubernetes.io/worker: ""
+        topology.kubenodesmith.io/pool: baremetal-test
+    scaleUp:
+      batchSize: 1
+    scaleDown:
+      maxConcurrent: 1

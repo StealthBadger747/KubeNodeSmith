@@ -21,12 +21,18 @@ spec:
       - name: kubenodesmith
         image: stealthbadger747/kubenodesmith:main
         imagePullPolicy: Always
+        volumeMounts:
+        - name: scaler-config
+          mountPath: /config
+          readOnly: true
         env:
         - name: PROXMOX_SECRET
           valueFrom:
             secretKeyRef:
               name: proxmox-api-secret
               key: PROXMOX_SECRET
+        - name: SCALER_CONFIG_PATH
+          value: /config/scaler-config.yaml
         ports:
           - name: http-health
             containerPort: 8080
@@ -59,6 +65,10 @@ spec:
         - key: node-role.kubernetes.io/master
           operator: Exists 
           effect: NoSchedule
+      volumes:
+      - name: scaler-config
+        configMap:
+          name: scaler-config
 ---
 apiVersion: v1
 kind: ServiceAccount
