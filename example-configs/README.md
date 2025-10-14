@@ -99,7 +99,6 @@ nodePools:
       kubeNodeNamePrefix: zagato-worker-auto
       cpuCores: 4
       memoryMiB: 6144
-      diskGiB: 40
       architecture: amd64
       tags:
         provider-tag: zagato-k3s-auto
@@ -120,7 +119,7 @@ Details:
 - `limits` places hard bounds on how many machines this pool can manage.
 - `machineTemplate` maps onto the `provider.MachineSpec` structure:
   - `kubeNodeNamePrefix` keeps the Kubernetes node names stable.
-  - `cpuCores`, `memoryMiB`, `diskGiB`, `architecture` define the node shape.
+  - `cpuCores`, `memoryMiB`, `architecture` define the node shape.
   - `tags` carry provider metadata.
   - `labels` are Kubernetes node labels to apply post-bootstrap.
 - `scaleUp` / `scaleDown` expose pacing knobs you can tune later.

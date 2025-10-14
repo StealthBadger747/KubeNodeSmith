@@ -23,9 +23,8 @@ data:
           vmIDRange:
             lower: 1250
             upper: 1300
-          vmMemOverheadMiB: 2046
-          vmTags:
-            - zagato-k3s-auto
+          managedNodeTag: kubenodesmith-managed
+          vmMemOverheadMiB: 2048
           networkInterfaces:
             - name: net0
               model: virtio
@@ -49,28 +48,17 @@ data:
               value: local-zfs:16
             - name: cicustom
               value: meta=snippets:snippets/zagato-shared-cloud-init-meta-data.yaml
-    
-      baremetal-lab:
-        type: redfish
-        credentialsRef:
-          name: redfish-secret
-          namespace: kubenodesmith
-        options:
-          bmcAddresses:
-            - 10.0.10.11
-            - 10.0.10.12
-    
+
     nodePools:
       - name: proxmox-small
         providerRef: proxmox-production
         limits:
           minNodes: 0
           maxNodes: 5
+          cpuCores: 0
+          memoryMiB: 30720
         machineTemplate:
           kubeNodeNamePrefix: zagato-worker-auto
-          cpuCores: 4
-          memoryMiB: 6144
-          diskGiB: 40
           architecture: amd64
           labels:
             node-role.kubernetes.io/worker: ""
@@ -81,22 +69,3 @@ data:
         scaleDown:
           maxConcurrent: 1
           drainTimeout: 10m
-    
-      - name: baremetal-test
-        providerRef: baremetal-lab
-        limits:
-          minNodes: 0
-          maxNodes: 2
-        machineTemplate:
-          kubeNodeNamePrefix: zagato-worker-bm
-          cpuCores: 8
-          memoryMiB: 16384
-          diskGiB: 80
-          architecture: amd64
-          labels:
-            node-role.kubernetes.io/worker: ""
-            topology.kubenodesmith.io/pool: baremetal-test
-        scaleUp:
-          batchSize: 1
-        scaleDown:
-          maxConcurrent: 1

@@ -16,9 +16,8 @@ providers:
       vmIDRange:
         lower: 1250
         upper: 1300
-      vmMemOverheadMiB: 2046
-      vmTags:
-        - zagato-k3s-auto
+      managedNodeTag: kubenodesmith-managed
+      vmMemOverheadMiB: 2048
       networkInterfaces:
         - name: net0
           model: virtio
@@ -59,37 +58,35 @@ nodePools:
     limits:
       minNodes: 0
       maxNodes: 5
+      cpuCores: 0 # Unlimited
+      memoryMiB: 30720
     machineTemplate:
       kubeNodeNamePrefix: zagato-worker-auto
-      cpuCores: 4
-      memoryMiB: 6144
-      diskGiB: 40
       architecture: amd64
       labels:
         node-role.kubernetes.io/worker: ""
         topology.kubenodesmith.io/pool: proxmox-small
     scaleUp:
-      batchSize: 1
-      stabilizationWindow: 2m
+      batchSize: 1 # TODO: NOT Implemented yet
+      stabilizationWindow: 2m # TODO: NOT Implemented yet
     scaleDown:
-      maxConcurrent: 1
-      drainTimeout: 10m
+      maxConcurrent: 1 # TODO: NOT Implemented yet
+      drainTimeout: 10m # TODO: NOT Implemented yet
 
   - name: baremetal-test
     providerRef: baremetal-lab
     limits:
       minNodes: 0
       maxNodes: 2
+      cpuCores: 0 # Unlimited
+      memoryMiB: 30720
     machineTemplate:
       kubeNodeNamePrefix: zagato-worker-bm
-      cpuCores: 8
-      memoryMiB: 16384
-      diskGiB: 80
       architecture: amd64
       labels:
         node-role.kubernetes.io/worker: ""
         topology.kubenodesmith.io/pool: baremetal-test
     scaleUp:
-      batchSize: 1
+      batchSize: 1 # TODO: NOT Implemented yet
     scaleDown:
-      maxConcurrent: 1
+      maxConcurrent: 1 # TODO: NOT Implemented yet

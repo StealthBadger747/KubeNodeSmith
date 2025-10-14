@@ -3,15 +3,21 @@ package proxmox
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"math/rand/v2"
+	"net/http"
 	"strconv"
 	"strings"
 
 	proxmoxapi "github.com/luthermonson/go-proxmox"
 
-	"kubernetes-autoscaler/internal/config"
-	"kubernetes-autoscaler/internal/provider"
+	"github.com/StealthBadger747/KubeNodeSmith/internal/config"
+	"github.com/StealthBadger747/KubeNodeSmith/internal/provider"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	"gopkg.in/yaml.v3"
 )
@@ -22,7 +28,7 @@ type Options struct {
 	NodeWhitelist    []string
 	VMIDRange        VMIDRange
 	VMMemOverheadMiB int64
-	VMTags           []string
+	managedNodeTag   string
 	Proxmox          *config.ProxmoxProviderOptions
 }
 
@@ -43,6 +49,11 @@ type Credentials struct {
 type Provider struct {
 	client proxmoxapi.Client
 	opts   Options
+}
+
+// Endpoint returns the API endpoint configured for this provider.
+func (p *Provider) Endpoint() string {
+	return p.opts.Endpoint
 }
 
 func generateNewVMID(existingVMIDs []uint64, opts Options) (int, error) {
@@ -105,17 +116,29 @@ func generateRandomMAC(prefix string) string {
 // NewProvider constructs a Proxmox-backed provider instance. It is expected to be called by the
 // autoscaler during startup. Secrets needed for authentication should already be resolved by the
 // caller and passed in via creds.
-func NewProvider(ctx context.Context, cfg config.ProviderConfig, creds Credentials) (*Provider, error) {
+func NewProvider(ctx context.Context, cfg config.ProviderConfig) (*Provider, error) {
 	parsedOpts, err := parseOptions(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("parse proxmox options: %w", err)
 	}
-	_ = ctx
 
-	client := proxmoxapi.NewClient(parsedOpts.Endpoint)
-	// TODO: wire TLS and token auth using creds once implementation work starts.
-	_ = creds
-	_ = client
+	creds, err := loadCredentials(ctx, cfg.CredentialsRef)
+	if err != nil {
+		return nil, err
+	}
+
+	httpClient := &http.Client{}
+	if creds.InsecureSkipTLSVerify {
+		httpClient.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+	}
+
+	client := proxmoxapi.NewClient(
+		parsedOpts.Endpoint,
+		proxmoxapi.WithHTTPClient(httpClient),
+		proxmoxapi.WithAPIToken(creds.TokenID, creds.Secret),
+	)
 
 	return &Provider{
 		client: *client,
@@ -131,6 +154,9 @@ func parseOptions(cfg config.ProviderConfig) (Options, error) {
 	if cfg.Options == nil {
 		return Options{}, fmt.Errorf("proxmox provider options are required")
 	}
+	if cfg.Proxmox == nil {
+		return Options{}, fmt.Errorf("proxmox provider vmOptions are required")
+	}
 
 	encoded, err := yaml.Marshal(cfg.Options)
 	if err != nil {
@@ -144,8 +170,8 @@ func parseOptions(cfg config.ProviderConfig) (Options, error) {
 			Lower int64 `yaml:"lower"`
 			Upper int64 `yaml:"upper"`
 		} `yaml:"vmIDRange"`
-		VMMemOverheadMiB int64    `yaml:"vmMemOverheadMiB"`
-		VMTags           []string `yaml:"vmTags"`
+		VMMemOverheadMiB int64  `yaml:"vmMemOverheadMiB"`
+		managedNodeTag   string `yaml:"managedNodeTag"`
 	}
 
 	dec := yaml.NewDecoder(bytes.NewReader(encoded))
@@ -162,7 +188,7 @@ func parseOptions(cfg config.ProviderConfig) (Options, error) {
 		Endpoint:         spec.Endpoint,
 		NodeWhitelist:    append([]string(nil), spec.NodeWhitelist...),
 		VMMemOverheadMiB: spec.VMMemOverheadMiB,
-		VMTags:           append([]string(nil), spec.VMTags...),
+		managedNodeTag:   spec.managedNodeTag,
 	}
 
 	if spec.VMIDRange != nil {
@@ -174,6 +200,56 @@ func parseOptions(cfg config.ProviderConfig) (Options, error) {
 
 	opts.Proxmox = cfg.Proxmox
 	return opts, nil
+}
+
+// loadCredentials fetches and validates the credentials referenced by ref.
+func loadCredentials(ctx context.Context, ref *config.CredentialsRef) (Credentials, error) {
+	if ref == nil {
+		return Credentials{}, fmt.Errorf("credentialsRef is required")
+	}
+
+	restCfg, err := rest.InClusterConfig()
+	if err != nil {
+		return Credentials{}, fmt.Errorf("build in-cluster config: %w", err)
+	}
+
+	clientset, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		return Credentials{}, fmt.Errorf("create kubernetes client: %w", err)
+	}
+
+	secret, err := clientset.CoreV1().Secrets(ref.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
+	if err != nil {
+		return Credentials{}, fmt.Errorf("fetch secret %s/%s: %w", ref.Namespace, ref.Name, err)
+	}
+
+	tokenID := strings.TrimSpace(string(secret.Data["PROXMOX_TOKEN_ID"]))
+	if tokenID == "" {
+		return Credentials{}, fmt.Errorf("secret %s/%s missing PROXMOX_TOKEN_ID", ref.Namespace, ref.Name)
+	}
+
+	secretValue := strings.TrimSpace(string(secret.Data["PROXMOX_SECRET"]))
+	if secretValue == "" {
+		return Credentials{}, fmt.Errorf("secret %s/%s missing PROXMOX_SECRET", ref.Namespace, ref.Name)
+	}
+
+	insecure := false
+	if raw, ok := secret.Data["PROXMOX_SKIP_TLS_VERIFY"]; ok {
+		val := strings.TrimSpace(string(raw))
+		if val != "" {
+			parsed, err := strconv.ParseBool(val)
+			if err != nil {
+				return Credentials{}, fmt.Errorf("secret %s/%s invalid PROXMOX_SKIP_TLS_VERIFY: %w", ref.Namespace, ref.Name, err)
+			}
+			insecure = parsed
+		}
+	}
+
+	return Credentials{
+		TokenID:               tokenID,
+		Secret:                secretValue,
+		InsecureSkipTLSVerify: insecure,
+	}, nil
 }
 
 // TODO: Make this smarter
@@ -305,6 +381,7 @@ func buildVirtualMachineOptions(machineName string, spec provider.MachineSpec, o
 	return vmOpts, nil
 }
 
+// ProvisionMachine creates a new VM in the Proxmox cluster that will eventually join the Kubernetes cluster.
 func (p *Provider) ProvisionMachine(ctx context.Context, spec provider.MachineSpec) (*provider.Machine, error) {
 	cluster, err := p.client.Cluster(ctx)
 	if err != nil {
@@ -342,15 +419,122 @@ func (p *Provider) ProvisionMachine(ctx context.Context, spec provider.MachineSp
 	if err != nil {
 		return nil, fmt.Errorf("build VM options: %w", err)
 	}
-	_ = vmOptions
 
-	return nil, fmt.Errorf("ProvisionMachine not implemented")
+	newVMTask, err := proxNode.NewVirtualMachine(ctx, newVMID, vmOptions...)
+	if err != nil {
+		fmt.Printf("Error creating new VM: %v\n", err)
+		panic(err)
+	}
+
+	// 5) Wait for task to finish
+	if err := newVMTask.WaitFor(ctx, 600); err != nil {
+		panic(err)
+	}
+
+	// 6) Power on
+	vm, err := proxNode.VirtualMachine(ctx, newVMID)
+	if err != nil {
+		panic(err)
+	}
+	if _, err := vm.Start(ctx); err != nil {
+		panic(err)
+	}
+
+	return &provider.Machine{
+		ProviderID:   machineName,
+		KubeNodeName: machineName,
+	}, nil
 }
 
+func findNodeWithVM(vmName string, ctx context.Context, proxClient *proxmoxapi.Client) (*proxmoxapi.Node, *proxmoxapi.VirtualMachine, error) {
+	nodeStatuses, err := proxClient.Nodes(ctx)
+	if err != nil {
+		fmt.Printf("Error getting nodeStatuses: %v\n", err)
+		panic(err)
+	}
+	for _, nodeStatus := range nodeStatuses {
+		node, err := proxClient.Node(ctx, nodeStatus.Name)
+		if err != nil {
+			fmt.Printf("Error getting node: %v\n", err)
+			panic(err)
+		}
+		vms, err := node.VirtualMachines(ctx)
+		if err != nil {
+			fmt.Printf("Error getting vms: %v\n", err)
+			panic(err)
+		}
+		for _, vm := range vms {
+			if vm.Name == vmName {
+				return node, vm, nil
+			}
+		}
+	}
+	return nil, nil, fmt.Errorf("VM with name %s not found", vmName)
+}
+
+// DeprovisionMachine deletes a VM previously created by ProvisionMachine.
 func (p *Provider) DeprovisionMachine(ctx context.Context, machine provider.Machine) error {
-	return fmt.Errorf("DeprovisionMachine not implemented")
+	_, proxVM, err := findNodeWithVM(machine.KubeNodeName, ctx, &p.client)
+	if err != nil {
+		return err
+	}
+
+	if !strings.Contains(proxVM.Tags, p.opts.managedNodeTag) {
+		err := fmt.Errorf("refusing to delete targeted VM `%s` in node %s because it does not have required tag", proxVM.Name, machine.KubeNodeName)
+		return err
+	}
+
+	stopVMTask, err := proxVM.Stop(ctx)
+	if err != nil {
+		fmt.Printf("Error Stopping VM: %v\n", err)
+		return err
+	}
+
+	if err := stopVMTask.WaitFor(ctx, 600); err != nil {
+		return err
+	}
+
+	deleteVMTask, err := proxVM.Delete(ctx)
+	if err != nil {
+		fmt.Printf("Error Deleting VM: %v\n", err)
+		return err
+	}
+
+	if err := deleteVMTask.WaitFor(ctx, 600); err != nil {
+		return err
+	}
+
+	return nil
 }
 
+// ListMachines returns the set of machines currently managed by this provider. The result should only include machines that match the prefixes
+// and tags supplied during provisioning so the autoscaler can detect drift.
 func (p *Provider) ListMachines(ctx context.Context, namePrefix string) ([]provider.Machine, error) {
-	return nil, fmt.Errorf("ListMachines not implemented")
+	nodeStatuses, err := p.client.Nodes(ctx)
+	if err != nil {
+		fmt.Printf("Error getting nodeStatuses: %v\n", err)
+		panic(err)
+	}
+	machines := []provider.Machine{}
+	for _, nodeStatus := range nodeStatuses {
+		node, err := p.client.Node(ctx, nodeStatus.Name)
+		if err != nil {
+			fmt.Printf("Error getting node: %v\n", err)
+			panic(err)
+		}
+		vms, err := node.VirtualMachines(ctx)
+		if err != nil {
+			fmt.Printf("Error getting vms: %v\n", err)
+			panic(err)
+		}
+		for _, vm := range vms {
+			if strings.HasPrefix(vm.Name, namePrefix) && strings.Contains(vm.Tags, p.opts.managedNodeTag) {
+				machines = append(machines, provider.Machine{
+					ProviderID:   vm.Name,
+					KubeNodeName: vm.Name,
+				})
+			}
+		}
+	}
+	return machines, nil
 }

@@ -13,11 +13,6 @@ type MachineSpec struct {
 	CPUCores int64
 	// MemoryMiB is the desired memory size in mebibytes available to the node.
 	MemoryMiB int64
-	// DiskGiB optionally communicates the boot disk size expectation.
-	DiskGiB int64
-	// Tags allow callers to persist backend specific metadata (e.g. proxmox VM
-	// tags) that help identify managed machines.
-	Tags map[string]string
 }
 
 // Machine represents a node that the backend provider manages on behalf of the
@@ -27,8 +22,6 @@ type Machine struct {
 	ProviderID string
 	// KubeNodeName is the name the node will register with inside Kubernetes.
 	KubeNodeName string
-	// Tags echo provider-side labels to support idempotency or filtering.
-	Tags map[string]string
 }
 
 // Provider defines the lifecycle operations required by the autoscaler to work

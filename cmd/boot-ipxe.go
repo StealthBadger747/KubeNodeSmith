@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"flag"
 	"fmt"
 	"math"
@@ -15,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	kube "kubernetes-autoscaler/internal"
+	kube "github.com/StealthBadger747/KubeNodeSmith/internal"
 
 	"github.com/luthermonson/go-proxmox"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -170,26 +169,6 @@ func createVM(client proxmox.Client, nodeName string, cpu int64, memMiB int64) (
 	}
 
 	return nodeName, newVMID
-}
-
-func startHealthServer() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
-
-	server := &http.Server{
-		Addr:              ":8080",
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-
-	go func() {
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			fmt.Fprintf(os.Stderr, "health server error: %v\n", err)
-		}
-	}()
 }
 
 func deleteVM(client proxmox.Client, proxNodeName string, vmid int) {
@@ -365,7 +344,7 @@ func old_main() {
 
 				fmt.Println("Looking for nodes to scale down!")
 
-				nodes, err := kube.GetScaleDownCandiates(ctx, cs, VM_NAME_PREFIX)
+				nodes, err := kube.GetScaleDownCandiates(ctx, cs, "zagato-worker-auto", "topology.kubenodesmith.io/pool", "zagato-worker-auto")
 				if err != nil {
 					panic(err)
 				}

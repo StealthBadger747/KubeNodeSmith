@@ -101,6 +101,27 @@ func toleratesUnschedulable(pod *corev1.Pod) bool {
 	return false
 }
 
+func GetNodesByLabel(ctx context.Context, clientset *kubernetes.Clientset, labelKey string, labelValue string) ([]corev1.Node, error) {
+	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	var foundNodes []corev1.Node
+
+	for _, node := range nodes.Items {
+		for k := range node.Labels {
+			if k == labelKey && node.Labels[k] == labelValue {
+				foundNodes = append(foundNodes, node)
+				break
+			}
+		}
+
+	}
+
+	return foundNodes, nil
+}
+
 func CordonNode(ctx context.Context, clientset *kubernetes.Clientset, nodeName string) error {
 	node, err := clientset.CoreV1().Nodes().Get(
 		ctx,
@@ -292,15 +313,150 @@ func GetRequestedResources(pod *corev1.Pod) (cpuMilli int64, memBytes int64) {
 	return
 }
 
-func GetScaleDownCandiates(ctx context.Context, clientset *kubernetes.Clientset, nodePrefix string) ([]corev1.Node, error) {
-	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+// PoolResourceUsage represents the current resource utilization of a node pool
+// All values are in Kubernetes native units (millicores for CPU, bytes for memory)
+type PoolResourceUsage struct {
+	// Used resources - what pods are actually consuming (from resource requests)
+	// Currently same as Allocated, but can be enhanced to track actual usage
+	UsedCPUMilli    int64
+	UsedMemoryBytes int64
+
+	// Allocated resources - what pods have requested (from resource requests)
+	// This includes all pods: user pods, DaemonSets, system pods, etc.
+	AllocatedCPUMilli    int64
+	AllocatedMemoryBytes int64
+
+	// Available resources - what's available for new pods (allocatable - allocated)
+	AvailableCPUMilli    int64
+	AvailableMemoryBytes int64
+
+	// Total allocatable capacity - total resources available for pod scheduling
+	// This is node.Status.Allocatable (Capacity minus system reservations)
+	AllocatableCPUMilli    int64
+	AllocatableMemoryBytes int64
+
+	// Total system capacity - total resources on the nodes (for limit checking)
+	// This is node.Status.Capacity (total system resources)
+	TotalCPUMilli    int64
+	TotalMemoryBytes int64
+
+	NodeCount int
+}
+
+// GetPoolResourceUsage calculates the current resource utilization of a node pool
+// Based on Kubernetes allocatable resources (what's available for pod scheduling)
+// and pod resource requests (what pods have requested)
+func GetPoolResourceUsage(ctx context.Context, clientset *kubernetes.Clientset, nodepoolKey string, nodepoolValue string) (*PoolResourceUsage, error) {
+	nodes, err := GetNodesByLabel(ctx, clientset, nodepoolKey, nodepoolValue)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get nodes in pool: %w", err)
+	}
+
+	var allocatableCPUMilli int64
+	var allocatableMemBytes int64
+	var totalCPUMilli int64
+	var totalMemBytes int64
+	var allocatedCPUMilli int64
+	var allocatedMemBytes int64
+
+	// Calculate total node capacity and allocated resources
+	for _, node := range nodes {
+		// Get node allocatable resources (what's actually available for pod scheduling)
+		// This is Capacity minus system reservations (kubelet, system daemons, etc.)
+		if cpu := node.Status.Allocatable.Cpu(); cpu != nil {
+			allocatableCPUMilli += cpu.MilliValue()
+		}
+		if mem := node.Status.Allocatable.Memory(); mem != nil {
+			allocatableMemBytes += mem.Value()
+		}
+
+		// Get total system capacity (for limit checking)
+		if cpu := node.Status.Capacity.Cpu(); cpu != nil {
+			totalCPUMilli += cpu.MilliValue()
+		}
+		if mem := node.Status.Capacity.Memory(); mem != nil {
+			totalMemBytes += mem.Value()
+		}
+
+		// Get all pods on this node (including DaemonSets, critical pods, etc.)
+		pods, err := getAllPodsOnNode(ctx, clientset, node.Name)
+		if err != nil {
+			// If we can't get pods for a node, skip it but continue with others
+			fmt.Printf("Warning: failed to get pods for node %s: %v\n", node.Name, err)
+			continue
+		}
+
+		// Calculate allocated resources for this node
+		for _, pod := range pods {
+			cpuMilli, memBytes := GetRequestedResources(&pod)
+			allocatedCPUMilli += cpuMilli
+			allocatedMemBytes += memBytes
+		}
+	}
+
+	// Calculate available resources (based on allocatable, not total)
+	availableCPUMilli := allocatableCPUMilli - allocatedCPUMilli
+	availableMemBytes := allocatableMemBytes - allocatedMemBytes
+
+	// For now, used resources are the same as allocated (we could enhance this later to track actual usage)
+	usedCPUMilli := allocatedCPUMilli
+	usedMemBytes := allocatedMemBytes
+
+	return &PoolResourceUsage{
+		UsedCPUMilli:           usedCPUMilli,
+		UsedMemoryBytes:        usedMemBytes,
+		AllocatedCPUMilli:      allocatedCPUMilli,
+		AllocatedMemoryBytes:   allocatedMemBytes,
+		AvailableCPUMilli:      availableCPUMilli,
+		AvailableMemoryBytes:   availableMemBytes,
+		AllocatableCPUMilli:    allocatableCPUMilli,
+		AllocatableMemoryBytes: allocatableMemBytes,
+		TotalCPUMilli:          totalCPUMilli,
+		TotalMemoryBytes:       totalMemBytes,
+		NodeCount:              len(nodes),
+	}, nil
+}
+
+// getAllPodsOnNode gets all pods running on a specific node that consume resources
+func getAllPodsOnNode(ctx context.Context, clientset *kubernetes.Clientset, nodeName string) ([]corev1.Pod, error) {
+	podList, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{
+		FieldSelector: fields.OneTermEqualSelector("spec.nodeName", nodeName).String(),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var pods []corev1.Pod
+	for _, pod := range podList.Items {
+		// Skip mirror pods (static pods) - they don't consume resources
+		if _, ok := pod.Annotations["kubernetes.io/config.mirror"]; ok {
+			continue
+		}
+		// Skip pods that are already being deleted - they're not consuming resources
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		// Skip terminal pods (Succeeded/Failed) - they're not consuming resources
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+
+		// Include all other pods (DaemonSets, regular pods, critical pods, etc.)
+		pods = append(pods, pod)
+	}
+
+	return pods, nil
+}
+
+func GetScaleDownCandiates(ctx context.Context, clientset *kubernetes.Clientset, nodePrefix string, nodepoolKey string, nodepoolValue string) ([]corev1.Node, error) {
+	nodes, err := GetNodesByLabel(ctx, clientset, nodepoolKey, nodepoolValue) //clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
 
 	var candidates []corev1.Node
 
-	for _, node := range nodes.Items {
+	for _, node := range nodes {
 		// Only collect nodes that are auto-scaled
 		if !strings.HasPrefix(node.Name, nodePrefix+"-") {
 			continue
@@ -320,6 +476,24 @@ func GetScaleDownCandiates(ctx context.Context, clientset *kubernetes.Clientset,
 	}
 
 	return candidates, nil
+}
+
+func LabelNode(ctx context.Context, clientset *kubernetes.Clientset, nodeName string, labels map[string]string) error {
+	node, err := clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+
+	if node.Labels == nil {
+		node.Labels = make(map[string]string)
+	}
+
+	for key, value := range labels {
+		node.Labels[key] = value
+	}
+
+	_, err = clientset.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
+	return err
 }
 
 func WaitForNodeReady(ctx context.Context, clientset *kubernetes.Clientset, nodeName string, timeout time.Duration) error {

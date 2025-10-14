@@ -85,18 +85,17 @@ type NodePool struct {
 	ScaleDown       *ScaleDownPolicy `yaml:"scaleDown,omitempty"`
 }
 
-// NodePoolLimits constrains min/max nodes per pool.
+// NodePoolLimits constrains min/max nodes per pool and resource limits.
 type NodePoolLimits struct {
-	MinNodes int `yaml:"minNodes"`
-	MaxNodes int `yaml:"maxNodes"`
+	MinNodes  int   `yaml:"minNodes"`
+	MaxNodes  int   `yaml:"maxNodes"`
+	CPUCores  int64 `yaml:"cpuCores"`
+	MemoryMiB int64 `yaml:"memoryMiB"`
 }
 
 // MachineTemplate captures the requested machine shape per node pool.
 type MachineTemplate struct {
 	KubeNodeNamePrefix string            `yaml:"kubeNodeNamePrefix"`
-	CPUCores           int64             `yaml:"cpuCores"`
-	MemoryMiB          int64             `yaml:"memoryMiB"`
-	DiskGiB            int64             `yaml:"diskGiB"`
 	Architecture       string            `yaml:"architecture"`
 	Labels             map[string]string `yaml:"labels,omitempty"`
 }
@@ -122,6 +121,11 @@ func Load(path string) (*Config, error) {
 	defer f.Close()
 
 	return decode(f)
+}
+
+// LoadFromString reads and parses a configuration from a string.
+func LoadFromString(content string) (*Config, error) {
+	return decode(bytes.NewReader([]byte(content)))
 }
 
 // decode unmarshals YAML into a Config while enforcing known fields.
