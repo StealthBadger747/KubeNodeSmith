@@ -312,24 +312,28 @@ func main() {
 
 	startHealthServer()
 
+	i := 0
 	for {
 		// Scaling loop
 		// Every 5th loop do a recoliliation pass
 		fmt.Printf("\n--------------------------------\n")
 		fmt.Printf("Starting scaling loop at %s\n", time.Now().Format(time.RFC3339))
 
-		for idx, np := range cfg.NodePools {
+		for _, np := range cfg.NodePools {
 			prov, ok := providers[np.ProviderRef]
 			if !ok {
 				log.Fatalf("provider %s not found for nodepool", np.ProviderRef)
 			}
 
-			if idx%5 == 0 {
+			if i%5 == 0 {
 				reconciler(ctx, kube.GetClientset(), &np, *prov)
+				i = 0
 			} else {
 				scaler(ctx, kube.GetClientset(), &np, *prov)
 			}
 		}
+
+		i++
 
 		fmt.Printf("\n--------------------------------\n\n")
 
