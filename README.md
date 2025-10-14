@@ -9,13 +9,11 @@ KubeNodeSmith is my home-lab friendly autoscaler. It watches Kubernetes for pods
 ## What’s in the repo?
 
 - `cmd/nodesmith` – the main event. Polls the cluster, talks to providers, labels nodes.
-- `cmd/boot-ipxe` – an older helper for one-off VM bootstrapping. Handy during experiments.
 - `internal/config` – YAML loader with validation and duration helpers.
 - `internal/kube.go` – all the Kubernetes querying, labelling, and resource math.
 - `internal/provider` – provider interface + the current Proxmox implementation.
 - `example-configs` – reference configs and notes to copy from.
 - `manifests` – deployment YAML (plain or Argo CD) plus a couple “stress the scheduler” workloads.
-- `nodesmith/` – a pre-built binary drop if you just want to poke around quickly.
 
 ---
 
