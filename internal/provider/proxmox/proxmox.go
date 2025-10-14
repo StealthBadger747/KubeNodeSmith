@@ -58,13 +58,21 @@ func (p *Provider) Endpoint() string {
 	return p.opts.Endpoint
 }
 
-func generateNewVMID(existingVMIDs []uint64, opts Options) (int, error) {
+func generateNewVMID(clusterResources proxmoxapi.ClusterResources, opts Options) (int, error) {
 	if opts.VMIDRange.Upper <= opts.VMIDRange.Lower {
 		return 0, fmt.Errorf("invalid VMID range: lower=%d upper=%d", opts.VMIDRange.Lower, opts.VMIDRange.Upper)
 	}
 	span := opts.VMIDRange.Upper - opts.VMIDRange.Lower + 1
 	if span == 0 {
 		return 0, fmt.Errorf("vmid range overflow")
+	}
+
+	existingVMIDs := make([]uint64, 0, len(clusterResources))
+
+	for _, resource := range clusterResources {
+		if resource.VMID >= opts.VMIDRange.Lower && resource.VMID <= opts.VMIDRange.Upper {
+			existingVMIDs = append(existingVMIDs, resource.VMID)
+		}
 	}
 
 	used := make(map[uint64]struct{}, len(existingVMIDs))
@@ -416,14 +424,7 @@ func (p *Provider) ProvisionMachine(ctx context.Context, spec provider.MachineSp
 		panic(err)
 	}
 
-	vmids := make([]uint64, 0, len(clusterResources))
-
-	for _, resource := range clusterResources {
-		// fmt.Printf("VMID: %d\n", resource.VMID)
-		vmids = append(vmids, resource.VMID)
-	}
-
-	newVMID, err := generateNewVMID(vmids, p.opts)
+	newVMID, err := generateNewVMID(clusterResources, p.opts)
 	if err != nil {
 		return nil, fmt.Errorf("allocate VMID: %w", err)
 	}
