@@ -16,7 +16,7 @@ data:
           name: proxmox-api-secret
           namespace: kubenodesmith
         options:
-          endpoint: https://100.64.0.25:8006/api2/json
+          endpoint: https://10.0.4.30:8006/api2/json
           nodeWhitelist:
             - alfaromeo
             - porsche
