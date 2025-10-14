@@ -19,7 +19,7 @@ spec:
       serviceAccountName: kubenodesmith
       containers:
       - name: kubenodesmith
-        image: stealthbadger747/kubenodesmith:latest
+        image: stealthbadger747/kubenodesmith:main
         imagePullPolicy: Always
         volumeMounts:
         - name: scaler-config
