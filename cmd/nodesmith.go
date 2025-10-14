@@ -74,7 +74,7 @@ func scaler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgpkg.N
 		os.Exit(1)
 	}
 
-	nodesInPool, err := kube.GetNodesByLabel(ctx, cs, "topology.kubenodesmith.io/pool", nodepoolCfg.Name)
+	nodesInPool, err := kube.GetNodesByLabel(ctx, cs, nodepoolCfg.GetPoolLabelKey(), nodepoolCfg.Name)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "list nodes in pool %q: %v\n", nodepoolCfg.Name, err)
 		return
@@ -102,7 +102,7 @@ func scaler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgpkg.N
 		fmt.Printf("Pod requires CPU: %d cores, Memory: %d MiB\n", cpu, memMiB)
 
 		// Get current pool resource usage
-		poolUsage, err := kube.GetPoolResourceUsage(ctx, cs, "topology.kubenodesmith.io/pool", nodepoolCfg.Name)
+		poolUsage, err := kube.GetPoolResourceUsage(ctx, cs, nodepoolCfg.GetPoolLabelKey(), nodepoolCfg.Name)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to get pool resource usage: %v\n", err)
 			return
@@ -157,7 +157,7 @@ func scaler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgpkg.N
 			return
 		}
 
-		nodes, err := kube.GetScaleDownCandiates(ctx, cs, nodepoolCfg.MachineTemplate.KubeNodeNamePrefix, "topology.kubenodesmith.io/pool", nodepoolCfg.Name)
+		nodes, err := kube.GetScaleDownCandiates(ctx, cs, nodepoolCfg.MachineTemplate.KubeNodeNamePrefix, nodepoolCfg.GetPoolLabelKey(), nodepoolCfg.Name)
 		if err != nil {
 			panic(err)
 		}

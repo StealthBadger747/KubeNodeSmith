@@ -53,6 +53,14 @@ func (d Duration) AsDuration() time.Duration {
 	return d.Duration
 }
 
+// GetPoolLabelKey returns the pool label key for this node pool, with a default value if not specified.
+func (np *NodePool) GetPoolLabelKey() string {
+	if np.PoolLabelKey != "" {
+		return np.PoolLabelKey
+	}
+	return "topology.kubenodesmith.io/pool"
+}
+
 // Config represents the root configuration document.
 type Config struct {
 	SchemaVersion   string                    `yaml:"schemaVersion"`
@@ -79,6 +87,7 @@ type CredentialsRef struct {
 type NodePool struct {
 	Name            string           `yaml:"name"`
 	ProviderRef     string           `yaml:"providerRef"`
+	PoolLabelKey    string           `yaml:"poolLabelKey,omitempty"`
 	Limits          NodePoolLimits   `yaml:"limits"`
 	MachineTemplate MachineTemplate  `yaml:"machineTemplate"`
 	ScaleUp         *ScaleUpPolicy   `yaml:"scaleUp,omitempty"`

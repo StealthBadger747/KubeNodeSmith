@@ -55,6 +55,7 @@ providers:
 nodePools:
   - name: proxmox-small
     providerRef: proxmox-production
+    # poolLabelKey: "topology.kubenodesmith.io/pool"  # Optional: defaults to this value
     limits:
       minNodes: 0
       maxNodes: 5
