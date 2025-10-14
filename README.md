@@ -147,15 +147,6 @@ All Kubernetes interactions live in `internal/kube.go`; provider calls go throug
 
 ---
 
-## Development tips
-
-- `go fmt ./...` and `go test ./...` before committing.
-- Avoid adding new `panic` paths—bubble errors up instead (see TODO list).
-- When adding config knobs, update `internal/config` and drop an example into `example-configs/`.
-- The Proxmox provider supports `PROXMOX_SKIP_TLS_VERIFY=true` if your lab cluster has self-signed certs.
-
----
-
 ## Contributing & roadmap
 
 I keep the future wish-list in `TODO.md`: CRDs, better scheduling heuristics, more providers, observability, all the good stuff. If you open a PR, note how you tested it and what assumptions you made about your infrastructure.
@@ -164,4 +155,4 @@ I keep the future wish-list in `TODO.md`: CRDs, better scheduling heuristics, mo
 
 ## License
 
-No explicit license yet, so treat it as “all rights reserved” until one is published.
+Released under the [MIT License](LICENSE).
