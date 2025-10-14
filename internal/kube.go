@@ -102,24 +102,14 @@ func toleratesUnschedulable(pod *corev1.Pod) bool {
 }
 
 func GetNodesByLabel(ctx context.Context, clientset *kubernetes.Clientset, labelKey string, labelValue string) ([]corev1.Node, error) {
-	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{
+		LabelSelector: fields.OneTermEqualSelector(labelKey, labelValue).String(),
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	var foundNodes []corev1.Node
-
-	for _, node := range nodes.Items {
-		for k := range node.Labels {
-			if k == labelKey && node.Labels[k] == labelValue {
-				foundNodes = append(foundNodes, node)
-				break
-			}
-		}
-
-	}
-
-	return foundNodes, nil
+	return nodes.Items, nil
 }
 
 func CordonNode(ctx context.Context, clientset *kubernetes.Clientset, nodeName string) error {

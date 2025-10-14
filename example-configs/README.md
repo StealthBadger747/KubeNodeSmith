@@ -33,7 +33,7 @@ providers:
       name: proxmox-api-secret
       namespace: kubenodesmith
     options:
-      endpoint: https://100.64.0.25:8006/api2/json
+      endpoint: https://10.0.4.30:8006/api2/json
       nodeWhitelist:
         - alfaromeo
         - porsche
@@ -104,7 +104,6 @@ nodePools:
         provider-tag: zagato-k3s-auto
       labels:
         node-role.kubernetes.io/worker: ""
-        topology.kubenodesmith.io/pool: proxmox-small
     scaleUp:
       batchSize: 1
       stabilizationWindow: 2m
@@ -121,7 +120,7 @@ Details:
   - `kubeNodeNamePrefix` keeps the Kubernetes node names stable.
   - `cpuCores`, `memoryMiB`, `architecture` define the node shape.
   - `tags` carry provider metadata.
-  - `labels` are Kubernetes node labels to apply post-bootstrap.
+  - `labels` are Kubernetes node labels to apply post-bootstrap. The scaler always stamps the pool label (`topology.kubenodesmith.io/pool`) with the node pool name, so you can omit it here.
 - `scaleUp` / `scaleDown` expose pacing knobs you can tune later.
 
 ## Future CRD Migration

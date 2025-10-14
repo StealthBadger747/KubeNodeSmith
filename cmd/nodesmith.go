@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	kube "github.com/StealthBadger747/KubeNodeSmith/internal"
@@ -66,6 +67,91 @@ func checkPoolLimits(poolUsage *kube.PoolResourceUsage, limits *cfgpkg.NodePoolL
 	}
 
 	return false, ""
+}
+
+// deleteNode handles the complete node deletion process including cordon, pod eviction check, and machine deprovisioning
+func deleteNode(ctx context.Context, cs *kubernetes.Clientset, provider proxprovider.Provider, nodeName string) error {
+	fmt.Printf("Deleting node `%s`\n", nodeName)
+
+	node, err := cs.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get node %s: %w", nodeName, err)
+	}
+
+	if _, isControlPlane := node.Labels["node-role.kubernetes.io/control-plane"]; isControlPlane {
+		return fmt.Errorf("node %s is a control plane node, refusing deletion", nodeName)
+	}
+	if _, isMaster := node.Labels["node-role.kubernetes.io/master"]; isMaster {
+		return fmt.Errorf("node %s is a master node, refusing deletion", nodeName)
+	}
+
+	// Cordon the node
+	if err := kube.CordonNode(ctx, cs, nodeName); err != nil {
+		return fmt.Errorf("cordon node %s: %w", nodeName, err)
+	}
+
+	// Check for evictable pods
+	evictable, err := kube.GetEvictablePods(ctx, cs, nodeName)
+	if err != nil {
+		return fmt.Errorf("get evictable pods on node %s: %w", nodeName, err)
+	}
+
+	if len(evictable) != 0 {
+		return fmt.Errorf("node %s not empty (has %d evictable pods), skipping deletion", nodeName, len(evictable))
+	}
+
+	// Delete the node object
+	if err := cs.CoreV1().Nodes().Delete(ctx, nodeName, metav1.DeleteOptions{}); err != nil {
+		return fmt.Errorf("deleting node object %s: %w", nodeName, err)
+	}
+
+	// Deprovision the machine
+	if err := provider.DeprovisionMachine(ctx, providerpkg.Machine{
+		KubeNodeName: nodeName,
+	}); err != nil {
+		return fmt.Errorf("deprovisioning machine %s: %w", nodeName, err)
+	}
+
+	fmt.Printf("Successfully deleted node `%s`\n", nodeName)
+	return nil
+}
+
+// Reconciler looks for nodes that are orphaned (missing pool label) and deletes them
+func reconciler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgpkg.NodePool, provider proxprovider.Provider) {
+	fmt.Printf("Reconciling nodepool %q", nodepoolCfg.Name)
+
+	nodesInPool, err := cs.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "list nodes in pool %q: %v\n", nodepoolCfg.Name, err)
+		return
+	}
+
+	poolLabelKey := nodepoolCfg.GetPoolLabelKey()
+	namePrefix := nodepoolCfg.MachineTemplate.KubeNodeNamePrefix
+
+	for _, node := range nodesInPool.Items {
+		if !strings.HasPrefix(node.Name, namePrefix) {
+			continue
+		}
+		if _, hasPoolLabel := node.Labels[poolLabelKey]; hasPoolLabel {
+			continue
+		}
+		if node.DeletionTimestamp != nil {
+			continue
+		}
+		if _, isControlPlane := node.Labels["node-role.kubernetes.io/control-plane"]; isControlPlane {
+			continue
+		}
+		if _, isMaster := node.Labels["node-role.kubernetes.io/master"]; isMaster {
+			continue
+		}
+
+		fmt.Printf("Found node `%s` without pool label to reconcile (delete)\n", node.Name)
+
+		if err := deleteNode(ctx, cs, provider, node.Name); err != nil {
+			fmt.Fprintf(os.Stderr, "reconcile node %s: %v\n", node.Name, err)
+		}
+	}
 }
 
 func scaler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgpkg.NodePool, provider proxprovider.Provider) {
@@ -143,8 +229,19 @@ func scaler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgpkg.N
 			fmt.Printf("Warning: VM %s failed to become ready: %v\n", kubeNodeName, err)
 		}
 
+		labels := make(map[string]string, len(nodepoolCfg.MachineTemplate.Labels)+1)
+		for key, value := range nodepoolCfg.MachineTemplate.Labels {
+			labels[key] = value
+		}
+
+		poolLabelKey := nodepoolCfg.GetPoolLabelKey()
+		if existing, ok := labels[poolLabelKey]; ok && existing != nodepoolCfg.Name {
+			fmt.Printf("Overriding pool label %s=%s with %s for nodepool %s\n", poolLabelKey, existing, nodepoolCfg.Name, nodepoolCfg.Name)
+		}
+		labels[poolLabelKey] = nodepoolCfg.Name
+
 		// Put labels on kube node
-		if err := kube.LabelNode(ctx, cs, kubeNodeName, nodepoolCfg.MachineTemplate.Labels); err != nil {
+		if err := kube.LabelNode(ctx, cs, kubeNodeName, labels); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to label node %s: %v\n", kubeNodeName, err)
 		}
 
@@ -166,29 +263,8 @@ func scaler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgpkg.N
 		for _, node := range nodes {
 			fmt.Printf("Found node `%s` to scale down!\n", node.Name)
 
-			err := kube.CordonNode(ctx, cs, node.Name)
-			if err != nil {
-				panic(err)
-			}
-
-			evictable, err := kube.GetEvictablePods(ctx, cs, node.Name)
-			if err != nil {
-				panic(err)
-			}
-			if len(evictable) != 0 {
-				panic(fmt.Errorf("node not empty"))
-			}
-
-			err = cs.CoreV1().Nodes().Delete(ctx, node.Name, metav1.DeleteOptions{})
-			if err != nil {
-				panic(fmt.Errorf("deleting node object: %v", err))
-			}
-
-			err = provider.DeprovisionMachine(ctx, providerpkg.Machine{
-				KubeNodeName: node.Name,
-			})
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: deprovisioning machine `%s`: %v\n", node.Name, err)
+			if err := deleteNode(ctx, cs, provider, node.Name); err != nil {
+				fmt.Fprintf(os.Stderr, "scale down node %s: %v\n", node.Name, err)
 			}
 		}
 	}
@@ -238,13 +314,21 @@ func main() {
 
 	for {
 		// Scaling loop
-		for _, np := range cfg.NodePools {
+		// Every 5th loop do a recoliliation pass
+		fmt.Printf("\n--------------------------------\n")
+		fmt.Printf("Starting scaling loop at %s\n", time.Now().Format(time.RFC3339))
+
+		for idx, np := range cfg.NodePools {
 			prov, ok := providers[np.ProviderRef]
 			if !ok {
 				log.Fatalf("provider %s not found for nodepool", np.ProviderRef)
 			}
 
-			scaler(ctx, kube.GetClientset(), &np, *prov)
+			if idx%5 == 0 {
+				reconciler(ctx, kube.GetClientset(), &np, *prov)
+			} else {
+				scaler(ctx, kube.GetClientset(), &np, *prov)
+			}
 		}
 
 		fmt.Printf("\n--------------------------------\n\n")

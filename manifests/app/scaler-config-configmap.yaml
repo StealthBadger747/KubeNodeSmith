@@ -62,7 +62,6 @@ data:
           architecture: amd64
           labels:
             node-role.kubernetes.io/worker: ""
-            topology.kubenodesmith.io/pool: proxmox-small
         scaleUp:
           batchSize: 1
           stabilizationWindow: 2m

@@ -42,16 +42,6 @@ providers:
         - name: cicustom
           value: meta=snippets:snippets/zagato-shared-cloud-init-meta-data.yaml
 
-  baremetal-lab:
-    type: redfish
-    credentialsRef:
-      name: redfish-secret
-      namespace: kubenodesmith
-    options:
-      bmcAddresses:
-        - 10.0.10.11
-        - 10.0.10.12
-
 nodePools:
   - name: proxmox-small
     providerRef: proxmox-production
@@ -66,28 +56,9 @@ nodePools:
       architecture: amd64
       labels:
         node-role.kubernetes.io/worker: ""
-        topology.kubenodesmith.io/pool: proxmox-small
     scaleUp:
       batchSize: 1 # TODO: NOT Implemented yet
       stabilizationWindow: 2m # TODO: NOT Implemented yet
     scaleDown:
       maxConcurrent: 1 # TODO: NOT Implemented yet
       drainTimeout: 10m # TODO: NOT Implemented yet
-
-  - name: baremetal-test
-    providerRef: baremetal-lab
-    limits:
-      minNodes: 0
-      maxNodes: 2
-      cpuCores: 0 # Unlimited
-      memoryMiB: 30720
-    machineTemplate:
-      kubeNodeNamePrefix: zagato-worker-bm
-      architecture: amd64
-      labels:
-        node-role.kubernetes.io/worker: ""
-        topology.kubenodesmith.io/pool: baremetal-test
-    scaleUp:
-      batchSize: 1 # TODO: NOT Implemented yet
-    scaleDown:
-      maxConcurrent: 1 # TODO: NOT Implemented yet
