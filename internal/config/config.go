@@ -229,6 +229,7 @@ func (p ProviderConfig) decodeOptions() (ProviderConfig, error) {
 type ProxmoxProviderOptions struct {
 	NetworkInterfaces []ProxmoxNetworkInterface `yaml:"networkInterfaces"`
 	VMOptions         []ProxmoxOption           `yaml:"vmOptions"`
+	AdditionalOptions map[string]any            `yaml:",inline"`
 }
 
 type ProxmoxNetworkInterface struct {

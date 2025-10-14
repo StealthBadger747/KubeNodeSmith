@@ -171,7 +171,7 @@ func parseOptions(cfg config.ProviderConfig) (Options, error) {
 			Upper int64 `yaml:"upper"`
 		} `yaml:"vmIDRange"`
 		VMMemOverheadMiB int64  `yaml:"vmMemOverheadMiB"`
-		managedNodeTag   string `yaml:"managedNodeTag"`
+		ManagedNodeTag   string `yaml:"managedNodeTag"`
 	}
 
 	dec := yaml.NewDecoder(bytes.NewReader(encoded))
@@ -188,7 +188,7 @@ func parseOptions(cfg config.ProviderConfig) (Options, error) {
 		Endpoint:         spec.Endpoint,
 		NodeWhitelist:    append([]string(nil), spec.NodeWhitelist...),
 		VMMemOverheadMiB: spec.VMMemOverheadMiB,
-		managedNodeTag:   spec.managedNodeTag,
+		managedNodeTag:   spec.ManagedNodeTag,
 	}
 
 	if spec.VMIDRange != nil {
