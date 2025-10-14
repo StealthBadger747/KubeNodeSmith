@@ -186,6 +186,14 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
+	pollInterval := cfg.PollingInterval.AsDuration()
+	if pollInterval <= 0 {
+		pollInterval = 30 * time.Second
+		log.Printf("polling interval not specified or <= 0, defaulting to %s", pollInterval)
+	} else {
+		log.Printf("polling interval set to %s", pollInterval)
+	}
+
 	ctx := context.Background()
 	providers := make(map[string]*proxprovider.Provider)
 	for name, providerCfg := range cfg.Providers {
@@ -217,8 +225,8 @@ func main() {
 			scaler(ctx, kube.GetClientset(), &np, *prov)
 		}
 
-		fmt.Printf("\n\n\n--------------------------------\n\n\n")
+		fmt.Printf("\n--------------------------------\n\n")
 
-		time.Sleep(cfg.PollingInterval.AsDuration())
+		time.Sleep(pollInterval)
 	}
 }
