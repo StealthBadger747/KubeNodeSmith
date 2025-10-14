@@ -16,6 +16,7 @@ import (
 	providerpkg "github.com/StealthBadger747/KubeNodeSmith/internal/provider"
 	proxprovider "github.com/StealthBadger747/KubeNodeSmith/internal/provider/proxmox"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -164,7 +165,26 @@ func scaler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgpkg.N
 
 		for _, node := range nodes {
 			fmt.Printf("Found node `%s` to scale down!\n", node.Name)
-			err := provider.DeprovisionMachine(ctx, providerpkg.Machine{
+
+			err := kube.CordonNode(ctx, cs, node.Name)
+			if err != nil {
+				panic(err)
+			}
+
+			evictable, err := kube.GetEvictablePods(ctx, cs, node.Name)
+			if err != nil {
+				panic(err)
+			}
+			if len(evictable) != 0 {
+				panic(fmt.Errorf("node not empty"))
+			}
+
+			err = cs.CoreV1().Nodes().Delete(ctx, node.Name, metav1.DeleteOptions{})
+			if err != nil {
+				panic(fmt.Errorf("deleting node object: %v", err))
+			}
+
+			err = provider.DeprovisionMachine(ctx, providerpkg.Machine{
 				KubeNodeName: node.Name,
 			})
 			if err != nil {
