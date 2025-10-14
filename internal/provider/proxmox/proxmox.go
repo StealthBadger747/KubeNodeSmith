@@ -58,6 +58,16 @@ func (p *Provider) Endpoint() string {
 	return p.opts.Endpoint
 }
 
+func printNodes(nodeStatuses []*proxmoxapi.NodeStatus) {
+	for _, status := range nodeStatuses {
+		fmt.Printf("Node: %s, Status: %s,  Uptime: %d\n",
+			status.Node,
+			status.Status,
+			status.Uptime,
+		)
+	}
+}
+
 func generateNewVMID(clusterResources proxmoxapi.ClusterResources, opts Options) (int, error) {
 	if opts.VMIDRange.Upper <= opts.VMIDRange.Lower {
 		return 0, fmt.Errorf("invalid VMID range: lower=%d upper=%d", opts.VMIDRange.Lower, opts.VMIDRange.Upper)
@@ -381,6 +391,8 @@ func buildVirtualMachineOptions(machineName string, spec provider.MachineSpec, o
 	}
 
 	setOption("name", machineName)
+	setOption("tags", opts.managedNodeTag)
+
 	memory := spec.MemoryMiB
 	if opts.VMMemOverheadMiB > 0 {
 		memory += opts.VMMemOverheadMiB
@@ -469,14 +481,23 @@ func (p *Provider) ProvisionMachine(ctx context.Context, spec provider.MachineSp
 	}, nil
 }
 
-func findNodeWithVM(vmName string, ctx context.Context, proxClient *proxmoxapi.Client) (*proxmoxapi.Node, *proxmoxapi.VirtualMachine, error) {
+func findNodeByVMName(vmName string, ctx context.Context, proxClient *proxmoxapi.Client) (*proxmoxapi.Node, *proxmoxapi.VirtualMachine, error) {
 	nodeStatuses, err := proxClient.Nodes(ctx)
 	if err != nil {
 		fmt.Printf("Error getting nodeStatuses: %v\n", err)
 		panic(err)
 	}
+
 	for _, nodeStatus := range nodeStatuses {
-		node, err := proxClient.Node(ctx, nodeStatus.Name)
+		nodeName := nodeStatus.Node
+		if nodeStatus.Node == "" {
+			fmt.Printf("Skipping node with empty Node\n")
+			continue
+		}
+		if nodeStatus.Status != "online" {
+			continue
+		}
+		node, err := proxClient.Node(ctx, nodeName)
 		if err != nil {
 			fmt.Printf("Error getting node: %v\n", err)
 			panic(err)
@@ -497,7 +518,7 @@ func findNodeWithVM(vmName string, ctx context.Context, proxClient *proxmoxapi.C
 
 // DeprovisionMachine deletes a VM previously created by ProvisionMachine.
 func (p *Provider) DeprovisionMachine(ctx context.Context, machine provider.Machine) error {
-	_, proxVM, err := findNodeWithVM(machine.KubeNodeName, ctx, &p.client)
+	_, proxVM, err := findNodeByVMName(machine.KubeNodeName, ctx, &p.client)
 	if err != nil {
 		return err
 	}
@@ -509,21 +530,25 @@ func (p *Provider) DeprovisionMachine(ctx context.Context, machine provider.Mach
 
 	stopVMTask, err := proxVM.Stop(ctx)
 	if err != nil {
-		fmt.Printf("Error Stopping VM: %v\n", err)
+		err := fmt.Errorf("Error Stopping VM: %v\n", err)
 		return err
 	}
 
+	fmt.Printf("Waiting for VM %s to stop...\n", proxVM.Name)
 	if err := stopVMTask.WaitFor(ctx, 600); err != nil {
+		err := fmt.Errorf("Error waiting for VM stop: %v\n", err)
 		return err
 	}
 
 	deleteVMTask, err := proxVM.Delete(ctx)
 	if err != nil {
-		fmt.Printf("Error Deleting VM: %v\n", err)
+		err := fmt.Errorf("Error Deleting VM: %v\n", err)
 		return err
 	}
 
+	fmt.Printf("Waiting for VM %s to be deleted...\n", proxVM.Name)
 	if err := deleteVMTask.WaitFor(ctx, 600); err != nil {
+		err := fmt.Errorf("Error waiting for VM deletion: %v\n", err)
 		return err
 	}
 

@@ -164,10 +164,12 @@ func scaler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgpkg.N
 
 		for _, node := range nodes {
 			fmt.Printf("Found node `%s` to scale down!\n", node.Name)
-			provider.DeprovisionMachine(ctx, providerpkg.Machine{
+			err := provider.DeprovisionMachine(ctx, providerpkg.Machine{
 				KubeNodeName: node.Name,
 			})
-
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: deprovisioning machine `%s`: %v\n", node.Name, err)
+			}
 		}
 	}
 }
