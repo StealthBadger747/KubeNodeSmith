@@ -11,6 +11,7 @@ This document tracks all planned improvements and features for the Kubernetes au
 - [ ] **Implement NodePool targeting** - Target specific nodepools for scaling
 - [ ] **Fix pool limits calculations** - Include `vmMemOverheadMiB` in resource calculations
 - [ ] **Add ephemeral disks support** - Remove hardcoded `local-zfs:16`, make configurable
+- [ ] **OTEL** Implement OTEL tracing
 - [ ] **Implement scale up/down policies** - `batchSize`, `stabilizationWindow`, `maxConcurrent`, `drainTimeout`
 - [ ] **Add Redis/Asynq job queue** - Background job processing for node operations
 - [ ] **Implement lease acquisition** - Prevent concurrent scaling operations
