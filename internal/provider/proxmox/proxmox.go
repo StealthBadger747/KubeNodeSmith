@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 
@@ -317,6 +318,11 @@ func (p *Provider) getAvailableNode(ctx context.Context, spec provider.MachineSp
 		if r.Node == "" {
 			continue
 		}
+		// Skip offline nodes
+		if r.Status != "online" {
+			fmt.Fprintf(os.Stderr, "skipping offline proxmox node %s (status: %s)\n", r.Node, r.Status)
+			continue
+		}
 		resByNode[r.Node] = *r
 		allNames = append(allNames, r.Node)
 	}
@@ -427,13 +433,11 @@ func buildVirtualMachineOptions(machineName string, spec provider.MachineSpec, o
 func (p *Provider) ProvisionMachine(ctx context.Context, spec provider.MachineSpec) (*provider.Machine, error) {
 	cluster, err := p.client.Cluster(ctx)
 	if err != nil {
-		fmt.Printf("Error getting cluster: %v\n", err)
-		panic(err)
+		return nil, fmt.Errorf("get cluster: %w", err)
 	}
 	clusterResources, err := cluster.Resources(ctx, "vm")
 	if err != nil {
-		fmt.Printf("Error getting cluster resources: %v\n", err)
-		panic(err)
+		return nil, fmt.Errorf("get cluster resources: %w", err)
 	}
 
 	newVMID, err := generateNewVMID(clusterResources, p.opts)
@@ -442,8 +446,7 @@ func (p *Provider) ProvisionMachine(ctx context.Context, spec provider.MachineSp
 	}
 	proxNode, err := p.getAvailableNode(ctx, spec)
 	if err != nil {
-		fmt.Printf("Error getting available proxmox node: %v\n", err)
-		panic(err)
+		return nil, fmt.Errorf("get available proxmox node: %w", err)
 	}
 
 	fmt.Printf("New VMID: %d, on proxmox node: %s\n", newVMID, proxNode.Name)
@@ -457,22 +460,21 @@ func (p *Provider) ProvisionMachine(ctx context.Context, spec provider.MachineSp
 
 	newVMTask, err := proxNode.NewVirtualMachine(ctx, newVMID, vmOptions...)
 	if err != nil {
-		fmt.Printf("Error creating new VM: %v\n", err)
-		panic(err)
+		return nil, fmt.Errorf("create new VM: %w", err)
 	}
 
-	// 5) Wait for task to finish
+	// Wait for task to finish
 	if err := newVMTask.WaitFor(ctx, 600); err != nil {
-		panic(err)
+		return nil, fmt.Errorf("wait for VM creation: %w", err)
 	}
 
-	// 6) Power on
+	// Power on
 	vm, err := proxNode.VirtualMachine(ctx, newVMID)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("get VM %d: %w", newVMID, err)
 	}
 	if _, err := vm.Start(ctx); err != nil {
-		panic(err)
+		return nil, fmt.Errorf("start VM %d: %w", newVMID, err)
 	}
 
 	return &provider.Machine{
@@ -484,14 +486,12 @@ func (p *Provider) ProvisionMachine(ctx context.Context, spec provider.MachineSp
 func findNodeByVMName(vmName string, ctx context.Context, proxClient *proxmoxapi.Client) (*proxmoxapi.Node, *proxmoxapi.VirtualMachine, error) {
 	nodeStatuses, err := proxClient.Nodes(ctx)
 	if err != nil {
-		fmt.Printf("Error getting nodeStatuses: %v\n", err)
-		panic(err)
+		return nil, nil, fmt.Errorf("get node statuses: %w", err)
 	}
 
 	for _, nodeStatus := range nodeStatuses {
 		nodeName := nodeStatus.Node
 		if nodeStatus.Node == "" {
-			fmt.Printf("Skipping node with empty Node\n")
 			continue
 		}
 		if nodeStatus.Status != "online" {
@@ -499,13 +499,15 @@ func findNodeByVMName(vmName string, ctx context.Context, proxClient *proxmoxapi
 		}
 		node, err := proxClient.Node(ctx, nodeName)
 		if err != nil {
-			fmt.Printf("Error getting node: %v\n", err)
-			panic(err)
+			// If we can't access one node, try others
+			fmt.Fprintf(os.Stderr, "warning: failed to get node %s: %v\n", nodeName, err)
+			continue
 		}
 		vms, err := node.VirtualMachines(ctx)
 		if err != nil {
-			fmt.Printf("Error getting vms: %v\n", err)
-			panic(err)
+			// If we can't list VMs on one node, try others
+			fmt.Fprintf(os.Stderr, "warning: failed to get VMs on node %s: %v\n", nodeName, err)
+			continue
 		}
 		for _, vm := range vms {
 			if vm.Name == vmName {
@@ -560,20 +562,23 @@ func (p *Provider) DeprovisionMachine(ctx context.Context, machine provider.Mach
 func (p *Provider) ListMachines(ctx context.Context, namePrefix string) ([]provider.Machine, error) {
 	nodeStatuses, err := p.client.Nodes(ctx)
 	if err != nil {
-		fmt.Printf("Error getting nodeStatuses: %v\n", err)
-		panic(err)
+		return nil, fmt.Errorf("get node statuses: %w", err)
 	}
 	machines := []provider.Machine{}
 	for _, nodeStatus := range nodeStatuses {
+		// Skip offline nodes
+		if nodeStatus.Status != "online" {
+			continue
+		}
 		node, err := p.client.Node(ctx, nodeStatus.Name)
 		if err != nil {
-			fmt.Printf("Error getting node: %v\n", err)
-			panic(err)
+			fmt.Fprintf(os.Stderr, "warning: failed to get node %s: %v\n", nodeStatus.Name, err)
+			continue
 		}
 		vms, err := node.VirtualMachines(ctx)
 		if err != nil {
-			fmt.Printf("Error getting vms: %v\n", err)
-			panic(err)
+			fmt.Fprintf(os.Stderr, "warning: failed to get VMs on node %s: %v\n", nodeStatus.Name, err)
+			continue
 		}
 		for _, vm := range vms {
 			if strings.HasPrefix(vm.Name, namePrefix) && strings.Contains(vm.Tags, p.opts.managedNodeTag) {

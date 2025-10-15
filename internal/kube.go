@@ -456,7 +456,7 @@ func GetScaleDownCandiates(ctx context.Context, clientset *kubernetes.Clientset,
 		}
 		evictablePods, err := GetEvictablePods(ctx, clientset, node.Name)
 		if err != nil {
-			panic(err)
+			return nil, fmt.Errorf("get evictable pods for node %s: %w", node.Name, err)
 		}
 
 		if len(evictablePods) != 0 {

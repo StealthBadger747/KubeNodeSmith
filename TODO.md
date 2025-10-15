@@ -5,13 +5,12 @@ This document tracks all planned improvements and features for the Kubernetes au
 ## 🚀 High Priority Quick List
 
 **Immediate Action Items:**
-- [ ] **Replace panic() calls** - Proper error handling throughout codebase
 - [ ] **Build a reconciliation loop to detect drifts** - Detect drifts.
 - [ ] **Convert configuration into CRDs** - Make autoscaler Kubernetes-native
 - [ ] **Implement NodePool targeting** - Target specific nodepools for scaling
 - [ ] **Fix pool limits calculations** - Include `vmMemOverheadMiB` in resource calculations
-- [ ] **Add ephemeral disks support** - Remove hardcoded `local-zfs:16`, make configurable
-- [ ] **OTEL** Implement OTEL tracing
+- [ ] **Add ephemeral disks support** - Remove hardcoded `local-zfs:16,serial=CONTAINERD01,discard=on,ssd=1`, make configurable
+- [ ] **OTEL** - Implement OTEL tracing
 - [ ] **Implement scale up/down policies** - `batchSize`, `stabilizationWindow`, `maxConcurrent`, `drainTimeout`
 - [ ] **Add Redis/Asynq job queue** - Background job processing for node operations
 - [ ] **Implement lease acquisition** - Prevent concurrent scaling operations
@@ -36,7 +35,7 @@ This document tracks all planned improvements and features for the Kubernetes au
 
 ### 3. Storage and Disk Management
 - [ ] **Add ephemeral disks support**
-  - Remove hardcoded `local-zfs:16` in Proxmox provider
+  - Remove hardcoded `local-zfs:16,serial=CONTAINERD01,discard=on,ssd=1` in Proxmox provider
   - Add configurable ephemeral disk options to `ProxmoxProviderOptions`
   - Support multiple disk types (local-zfs, local-lvm, etc.)
   - Add disk size configuration per node pool

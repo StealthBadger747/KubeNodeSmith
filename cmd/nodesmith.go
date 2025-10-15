@@ -154,17 +154,15 @@ func reconciler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgp
 	}
 }
 
-func scaler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgpkg.NodePool, provider proxprovider.Provider) {
+func scaler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgpkg.NodePool, provider proxprovider.Provider) error {
 	pods, err := kube.GetUnschedulablePods(ctx, cs)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "unsched list error:", err)
-		os.Exit(1)
+		return fmt.Errorf("get unschedulable pods: %w", err)
 	}
 
 	nodesInPool, err := kube.GetNodesByLabel(ctx, cs, nodepoolCfg.GetPoolLabelKey(), nodepoolCfg.Name)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "list nodes in pool %q: %v\n", nodepoolCfg.Name, err)
-		return
+		return fmt.Errorf("list nodes in pool %q: %w", nodepoolCfg.Name, err)
 	}
 	nodePoolSize := len(nodesInPool)
 
@@ -180,7 +178,7 @@ func scaler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgpkg.N
 
 		if nodepoolCfg.Limits.MaxNodes > 0 && nodePoolSize >= nodepoolCfg.Limits.MaxNodes {
 			fmt.Printf("Node pool %q at or above max size (%d), skipping scale up\n", nodepoolCfg.Name, nodepoolCfg.Limits.MaxNodes)
-			return
+			return nil
 		}
 
 		cpuMili, memBytes := kube.GetRequestedResources(&pods[0])
@@ -191,8 +189,7 @@ func scaler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgpkg.N
 		// Get current pool resource usage
 		poolUsage, err := kube.GetPoolResourceUsage(ctx, cs, nodepoolCfg.GetPoolLabelKey(), nodepoolCfg.Name)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to get pool resource usage: %v\n", err)
-			return
+			return fmt.Errorf("get pool resource usage: %w", err)
 		}
 
 		// Display comprehensive resource information
@@ -209,7 +206,7 @@ func scaler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgpkg.N
 		// Check if adding a new node sized for this pod would exceed pool limits
 		if exceeded, reason := checkPoolLimits(poolUsage, &nodepoolCfg.Limits, cpuMili, memBytes); exceeded {
 			fmt.Printf("%s, skipping scale up\n", reason)
-			return
+			return nil
 		}
 
 		provisionedMachine, err := provider.ProvisionMachine(ctx, providerpkg.MachineSpec{
@@ -218,8 +215,7 @@ func scaler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgpkg.N
 			MemoryMiB:  memMiB,
 		})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "provision machine: %v\n", err)
-			return
+			return fmt.Errorf("provision machine: %w", err)
 		}
 		kubeNodeName := provisionedMachine.KubeNodeName
 
@@ -252,12 +248,12 @@ func scaler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgpkg.N
 
 		if nodepoolCfg.Limits.MinNodes > 0 && nodePoolSize <= nodepoolCfg.Limits.MinNodes {
 			fmt.Printf("Node pool %q at or below min size (%d), skipping scale down\n", nodepoolCfg.Name, nodepoolCfg.Limits.MinNodes)
-			return
+			return nil
 		}
 
 		nodes, err := kube.GetScaleDownCandiates(ctx, cs, nodepoolCfg.MachineTemplate.KubeNodeNamePrefix, nodepoolCfg.GetPoolLabelKey(), nodepoolCfg.Name)
 		if err != nil {
-			panic(err)
+			return fmt.Errorf("get scale down candidates: %w", err)
 		}
 
 		for _, node := range nodes {
@@ -268,6 +264,7 @@ func scaler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgpkg.N
 			}
 		}
 	}
+	return nil
 }
 
 func main() {
@@ -329,7 +326,9 @@ func main() {
 				reconciler(ctx, kube.GetClientset(), &np, *prov)
 				i = 0
 			} else {
-				scaler(ctx, kube.GetClientset(), &np, *prov)
+				if err := scaler(ctx, kube.GetClientset(), &np, *prov); err != nil {
+					fmt.Fprintf(os.Stderr, "scaler error for pool %s: %v\n", np.Name, err)
+				}
 			}
 		}
 
