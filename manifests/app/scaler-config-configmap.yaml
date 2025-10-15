@@ -45,7 +45,7 @@ data:
             - name: ide2
               value: local-zfs:cloudinit
             - name: scsi0
-              value: local-zfs:16
+              value: local-zfs:16,serial=CONTAINERD01,discard=on,ssd=1
             - name: cicustom
               value: meta=snippets:snippets/zagato-shared-cloud-init-meta-data.yaml
 
