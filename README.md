@@ -9,11 +9,11 @@ KubeNodeSmith is my home-lab friendly autoscaler. It watches Kubernetes for pods
 ## What’s in the repo?
 
 - `cmd/nodesmith` – the main event. Polls the cluster, talks to providers, labels nodes.
-- `internal/config` – YAML loader with validation and duration helpers.
+- `apis` – Go types for the Kubernetes CRDs.
+- `internal/config` – CRD loader with validation and duration helpers.
 - `internal/kube.go` – all the Kubernetes querying, labelling, and resource math.
 - `internal/provider` – provider interface + the current Proxmox implementation.
-- `example-configs` – reference configs and notes to copy from.
-- `manifests` – deployment YAML (plain or Argo CD) plus a couple “stress the scheduler” workloads.
+- `manifests` – CRDs, deployment YAML (plain or Argo CD), sample autoscaler resources, and “stress the scheduler” workloads.
 
 ---
 
@@ -30,15 +30,18 @@ KubeNodeSmith is my home-lab friendly autoscaler. It watches Kubernetes for pods
 
 ## Running it locally
 
-Using Nix? Drop into the dev shell and run it inline:
+Using Nix? Drop into the dev shell and run it inline once the CRDs and resources are in place:
 
 ```bash
 nix develop
-go run ./cmd/nodesmith --config ./example-configs/scaler-config.yaml
+kubectl apply -f manifests/crds/
+kubectl apply -f manifests/app/nodesmith-resources.yaml   # adjust for your lab before applying
+go run ./cmd/nodesmith --controller-name kubenodesmith --controller-namespace kubenodesmith
 ```
 
 The binary will:
 - read kubeconfig from `~/.kube/config` (honours `--kubeconfig`),
+- pull controller/pool/provider configuration from the NodeSmith CRDs,
 - look up the Proxmox secret in your cluster,
 - start polling immediately (default 30s cadence).
 
@@ -49,77 +52,99 @@ Pro tip: when running from your workstation the provider still uses the live Pro
 
 ## Deploying to Kubernetes
 
-1. Create the `kubenodesmith` namespace and load your Proxmox secret.
-2. Apply the manifests from `manifests/app/`:
+1. Create the `kubenodesmith` namespace (or pick your own) and load the Proxmox secret there.
+2. Install the CRDs:
    ```bash
-   kubectl apply -f manifests/app/
+   kubectl apply -f manifests/crds/
    ```
-3. The deployment mounts the ConfigMap at `/config` and sets `SCALER_CONFIG_PATH=/config/scaler-config.yaml` for you.
-4. Health checks live at `http://<pod>:8080/healthz`.
-5. If you prefer GitOps, sync `manifests/app/argocd-application.yaml` into Argo CD.
+3. Tweak `manifests/app/nodesmith-resources.yaml` for your environment, then apply it:
+   ```bash
+   kubectl apply -f manifests/app/nodesmith-resources.yaml
+   ```
+4. Deploy the controller workload and RBAC:
+   ```bash
+   kubectl apply -f manifests/app/kubenodesmith.yaml
+   ```
+   (or sync `manifests/app/argocd-application.yaml` if you prefer GitOps.)
+5. Health checks live at `http://<pod>:8080/healthz`.
 
 ---
 
 ## Configuration cheat sheet
 
-Everything lives in one YAML file (see `example-configs/scaler-config.yaml`).
+The autoscaler now reads Kubernetes-native CRDs under `kubenodesmith.parawell.cloud/v1alpha1`.
+`manifests/app/nodesmith-resources.yaml` shows the full picture:
 
 ```yaml
-schemaVersion: v1alpha1
-pollingInterval: 30s
-
-providers:
-  proxmox-production:
-    type: proxmox
-    credentialsRef:
-      name: proxmox-api-secret
-      namespace: kubenodesmith
-    options:
-      endpoint: https://10.0.4.30:8006/api2/json
-      nodeWhitelist: [alfaromeo, porsche]
-      vmIDRange:
-        lower: 1250
-        upper: 1300
-      managedNodeTag: kubenodesmith-managed
-      vmMemOverheadMiB: 2048
-      networkInterfaces:
-        - name: net0
-          model: virtio
-          bridge: vmbr0
-          vlanTag: 20
-          macPrefix: "02:00:00"
-      vmOptions:
-        - { name: sockets, value: 1 }
-        - { name: cpu, value: host }
-
-nodePools:
-  - name: proxmox-small
-    providerRef: proxmox-production
-    limits:
-      minNodes: 0
-      maxNodes: 5
-      cpuCores: 0        # 0 == “no cap”
-      memoryMiB: 30720   # pool-wide ceiling
-    machineTemplate:
-      kubeNodeNamePrefix: zagato-worker-auto
-      architecture: amd64
-      labels:
-        node-role.kubernetes.io/worker: ""
-    scaleUp:
-      batchSize: 1
-      stabilizationWindow: 2m
-    scaleDown:
-      maxConcurrent: 1
-      drainTimeout: 10m
+---
+apiVersion: kubenodesmith.parawell.cloud/v1alpha1
+kind: NodeSmithProvider
+metadata:
+  name: proxmox-production
+  namespace: kubenodesmith
+spec:
+  type: proxmox
+  credentialsSecretRef:
+    name: proxmox-api-secret
+    namespace: kubenodesmith
+  proxmox:
+    endpoint: https://10.0.4.30:8006/api2/json
+    nodeWhitelist: [alfaromeo, porsche]
+    vmIDRange: { lower: 1250, upper: 1300 }
+    managedNodeTag: kubenodesmith-managed
+    vmMemOverheadMiB: 2048
+    networkInterfaces:
+      - { name: net0, model: virtio, bridge: vmbr0, vlanTag: 20, macPrefix: "02:00:00" }
+    vmOptions:
+      - { name: sockets, value: 1 }
+      - { name: cpu, value: host }
+      - { name: boot, value: order=net0 }
+      - { name: ostype, value: l26 }
+      - { name: ipconfig0, value: ip=dhcp }
+      - { name: ide2, value: local-zfs:cloudinit }
+      - { name: scsi0, value: local-zfs:16,serial=CONTAINERD01,discard=on,ssd=1 }
+      - { name: cicustom, value: meta=snippets:snippets/zagato-shared-cloud-init-meta-data.yaml }
+---
+apiVersion: kubenodesmith.parawell.cloud/v1alpha1
+kind: NodeSmithPool
+metadata:
+  name: proxmox-small
+  namespace: kubenodesmith
+spec:
+  providerRef: proxmox-production
+  limits:
+    minNodes: 0
+    maxNodes: 5
+    cpuCores: 0
+    memoryMiB: 30720
+  machineTemplate:
+    kubeNodeNamePrefix: zagato-worker-auto
+    architecture: amd64
+    labels:
+      node-role.kubernetes.io/worker: ""
+  scaleUp:
+    batchSize: 1
+    stabilizationWindow: 2m
+  scaleDown:
+    maxConcurrent: 1
+    drainTimeout: 10m
+---
+apiVersion: kubenodesmith.parawell.cloud/v1alpha1
+kind: NodeSmithController
+metadata:
+  name: kubenodesmith
+  namespace: kubenodesmith
+spec:
+  pollingInterval: 30s
+  pools: [proxmox-small]
 ```
 
 Key things to remember:
 
-- `schemaVersion` is locked to `v1alpha1` for now.
-- `pollingInterval` is parsed with Go’s duration syntax (`30s`, `2m`, …).
-- Providers are decoded into strongly typed structs—unknown options are ignored but preserved.
-- Node pools define min/max counts plus aggregate CPU/memory ceilings to avoid runaways.
-- Labels in `machineTemplate` are stamped onto the node once it joins; the scaler automatically adds the pool label (`topology.kubenodesmith.io/pool: <nodePoolName>`), so you don’t have to include it.
+- All three resources live in the same namespace by default; the controller watches the pool names listed in its spec.
+- Durations use the usual Go syntax (`30s`, `2m`, …).
+- The controller reads provider credentials from the referenced secret at reconcile time—no more ConfigMap wiring.
+- Node pools still define min/max counts and aggregate CPU/memory ceilings; the controller adds the pool label (`topology.kubenodesmith.io/pool: <name>`) automatically.
 
 ---
 
@@ -147,7 +172,7 @@ All Kubernetes interactions live in `internal/kube.go`; provider calls go throug
 
 ## Contributing & roadmap
 
-I keep the future wish-list in `TODO.md`: CRDs, better scheduling heuristics, more providers, observability, all the good stuff. If you open a PR, note how you tested it and what assumptions you made about your infrastructure.
+I keep the future wish-list in `TODO.md`: better scheduling heuristics, more providers, observability, all the good stuff. If you open a PR, note how you tested it and what assumptions you made about your infrastructure.
 
 ---
 

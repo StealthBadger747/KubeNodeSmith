@@ -21,18 +21,13 @@ spec:
       - name: kubenodesmith
         image: stealthbadger747/kubenodesmith:main
         imagePullPolicy: Always
-        volumeMounts:
-        - name: scaler-config
-          mountPath: /config
-          readOnly: true
         env:
-        - name: PROXMOX_SECRET
+        - name: NODESMITH_CONTROLLER
+          value: kubenodesmith
+        - name: NODESMITH_NAMESPACE
           valueFrom:
-            secretKeyRef:
-              name: proxmox-api-secret
-              key: PROXMOX_SECRET
-        - name: SCALER_CONFIG_PATH
-          value: /config/scaler-config.yaml
+            fieldRef:
+              fieldPath: metadata.namespace
         ports:
           - name: http-health
             containerPort: 8080
@@ -65,10 +60,6 @@ spec:
         - key: node-role.kubernetes.io/master
           operator: Exists 
           effect: NoSchedule
-      volumes:
-      - name: scaler-config
-        configMap:
-          name: scaler-config
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -106,6 +97,9 @@ rules:
 - apiGroups: [""]
   resources: ["secrets"]
   verbs: ["get"]
+- apiGroups: ["kubenodesmith.parawell.cloud"]
+  resources: ["nodesmithcontrollers", "nodesmithproviders", "nodesmithpools"]
+  verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

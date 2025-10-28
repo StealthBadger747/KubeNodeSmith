@@ -1,0 +1,62 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: nodesmithcontrollers.kubenodesmith.parawell.cloud
+spec:
+  group: kubenodesmith.parawell.cloud
+  scope: Namespaced
+  names:
+    plural: nodesmithcontrollers
+    singular: nodesmithcontroller
+    kind: NodeSmithController
+    shortNames:
+      - nsc
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                pollingInterval:
+                  type: string
+                pools:
+                  type: array
+                  items:
+                    type: string
+                defaultProvider:
+                  type: string
+              required:
+                - pools
+            status:
+              type: object
+              properties:
+                observedGeneration:
+                  type: integer
+                  format: int64
+                lastSyncTime:
+                  type: string
+                  format: date-time
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - type
+                      - status
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time

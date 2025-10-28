@@ -1,56 +1,84 @@
 package config
 
 import (
-	"bytes"
+	"context"
 	"fmt"
-	"io"
-	"os"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	nodesmithv1alpha1 "github.com/StealthBadger747/KubeNodeSmith/apis/v1alpha1"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/dynamic"
 )
 
-// Duration wraps time.Duration to support YAML unmarshalling from strings like "30s".
+// Duration wraps time.Duration to preserve the previous API surface.
 type Duration struct {
 	time.Duration
-}
-
-// UnmarshalYAML parses duration strings (or numbers representing nanoseconds).
-func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
-	if value == nil {
-		d.Duration = 0
-		return nil
-	}
-
-	switch value.Kind {
-	case yaml.ScalarNode:
-		var asString string
-		if err := value.Decode(&asString); err == nil {
-			if asString == "" {
-				d.Duration = 0
-				return nil
-			}
-			parsed, err := time.ParseDuration(asString)
-			if err != nil {
-				return fmt.Errorf("invalid duration %q: %w", asString, err)
-			}
-			d.Duration = parsed
-			return nil
-		}
-
-		var asInt int64
-		if err := value.Decode(&asInt); err == nil {
-			d.Duration = time.Duration(asInt)
-			return nil
-		}
-	}
-
-	return fmt.Errorf("invalid duration value: %s", value.Value)
 }
 
 // AsDuration exposes the inner time.Duration value.
 func (d Duration) AsDuration() time.Duration {
 	return d.Duration
+}
+
+// Config represents the runtime configuration for the autoscaler.
+type Config struct {
+	PollingInterval Duration
+	Providers       map[string]ProviderConfig
+	NodePools       []NodePool
+}
+
+// ProviderConfig captures backend-specific configuration.
+type ProviderConfig struct {
+	Type           string
+	CredentialsRef *CredentialsRef
+	Proxmox        *ProxmoxProviderOptions
+}
+
+// CredentialsRef points the autoscaler to the secret holding provider credentials.
+type CredentialsRef struct {
+	Name      string
+	Namespace string
+}
+
+// NodePool describes an autoscaled group of machines.
+type NodePool struct {
+	Name            string
+	ProviderRef     string
+	PoolLabelKey    string
+	Limits          NodePoolLimits
+	MachineTemplate MachineTemplate
+	ScaleUp         *ScaleUpPolicy
+	ScaleDown       *ScaleDownPolicy
+}
+
+// NodePoolLimits constrains min/max nodes per pool and resource limits.
+type NodePoolLimits struct {
+	MinNodes  int
+	MaxNodes  int
+	CPUCores  int64
+	MemoryMiB int64
+}
+
+// MachineTemplate captures the requested machine shape per node pool.
+type MachineTemplate struct {
+	KubeNodeNamePrefix string
+	Architecture       string
+	Labels             map[string]string
+}
+
+// ScaleUpPolicy defines pacing controls for scale-out operations.
+type ScaleUpPolicy struct {
+	BatchSize           int
+	StabilizationWindow *Duration
+}
+
+// ScaleDownPolicy defines pacing controls for scale-in operations.
+type ScaleDownPolicy struct {
+	MaxConcurrent int
+	DrainTimeout  *Duration
 }
 
 // GetPoolLabelKey returns the pool label key for this node pool, with a default value if not specified.
@@ -61,114 +89,40 @@ func (np *NodePool) GetPoolLabelKey() string {
 	return "topology.kubenodesmith.io/pool"
 }
 
-// Config represents the root configuration document.
-type Config struct {
-	SchemaVersion   string                    `yaml:"schemaVersion"`
-	PollingInterval Duration                  `yaml:"pollingInterval"`
-	Providers       map[string]ProviderConfig `yaml:"providers"`
-	NodePools       []NodePool                `yaml:"nodePools"`
+// ProxmoxProviderOptions contains strongly typed Proxmox-specific settings.
+type ProxmoxProviderOptions struct {
+	Endpoint          string
+	NodeWhitelist     []string
+	VMIDRange         *VMIDRange
+	ManagedNodeTag    string
+	VMMemOverheadMiB  int64
+	NetworkInterfaces []ProxmoxNetworkInterface
+	VMOptions         []ProxmoxOption
 }
 
-// ProviderConfig captures backend-specific configuration.
-type ProviderConfig struct {
-	Type           string                  `yaml:"type"`
-	CredentialsRef *CredentialsRef         `yaml:"credentialsRef,omitempty"`
-	Options        map[string]any          `yaml:"options,omitempty"`
-	Proxmox        *ProxmoxProviderOptions `yaml:"-"`
+// VMIDRange constrains the VM identifiers a provider may use.
+type VMIDRange struct {
+	Lower int64
+	Upper int64
 }
 
-// CredentialsRef points the autoscaler to the secret holding provider credentials.
-type CredentialsRef struct {
-	Name      string `yaml:"name"`
-	Namespace string `yaml:"namespace"`
+// ProxmoxNetworkInterface describes a Proxmox network interface definition.
+type ProxmoxNetworkInterface struct {
+	Name      string
+	Model     string
+	Bridge    string
+	VLANTag   int
+	MACPrefix string
 }
 
-// NodePool describes an autoscaled group of machines.
-type NodePool struct {
-	Name            string           `yaml:"name"`
-	ProviderRef     string           `yaml:"providerRef"`
-	PoolLabelKey    string           `yaml:"poolLabelKey,omitempty"`
-	Limits          NodePoolLimits   `yaml:"limits"`
-	MachineTemplate MachineTemplate  `yaml:"machineTemplate"`
-	ScaleUp         *ScaleUpPolicy   `yaml:"scaleUp,omitempty"`
-	ScaleDown       *ScaleDownPolicy `yaml:"scaleDown,omitempty"`
-}
-
-// NodePoolLimits constrains min/max nodes per pool and resource limits.
-type NodePoolLimits struct {
-	MinNodes  int   `yaml:"minNodes"`
-	MaxNodes  int   `yaml:"maxNodes"`
-	CPUCores  int64 `yaml:"cpuCores"`
-	MemoryMiB int64 `yaml:"memoryMiB"`
-}
-
-// MachineTemplate captures the requested machine shape per node pool.
-type MachineTemplate struct {
-	KubeNodeNamePrefix string            `yaml:"kubeNodeNamePrefix"`
-	Architecture       string            `yaml:"architecture"`
-	Labels             map[string]string `yaml:"labels,omitempty"`
-}
-
-// ScaleUpPolicy defines pacing controls for scale-out operations.
-type ScaleUpPolicy struct {
-	BatchSize           int       `yaml:"batchSize,omitempty"`
-	StabilizationWindow *Duration `yaml:"stabilizationWindow,omitempty"`
-}
-
-// ScaleDownPolicy defines pacing controls for scale-in operations.
-type ScaleDownPolicy struct {
-	MaxConcurrent int       `yaml:"maxConcurrent,omitempty"`
-	DrainTimeout  *Duration `yaml:"drainTimeout,omitempty"`
-}
-
-// Load reads and parses a configuration file from disk.
-func Load(path string) (*Config, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open config: %w", err)
-	}
-	defer f.Close()
-
-	return decode(f)
-}
-
-// LoadFromString reads and parses a configuration from a string.
-func LoadFromString(content string) (*Config, error) {
-	return decode(bytes.NewReader([]byte(content)))
-}
-
-// decode unmarshals YAML into a Config while enforcing known fields.
-func decode(r io.Reader) (*Config, error) {
-	dec := yaml.NewDecoder(r)
-	dec.KnownFields(true)
-
-	var cfg Config
-	if err := dec.Decode(&cfg); err != nil {
-		if err == io.EOF {
-			return &cfg, nil
-		}
-		return nil, fmt.Errorf("parse config: %w", err)
-	}
-
-	if err := cfg.Validate(); err != nil {
-		return nil, err
-	}
-
-	if err := cfg.postProcess(); err != nil {
-		return nil, err
-	}
-
-	return &cfg, nil
+// ProxmoxOption is a name/value pair passed through to the Proxmox API.
+type ProxmoxOption struct {
+	Name  string
+	Value interface{}
 }
 
 // Validate performs light integrity checks on the configuration.
 func (c *Config) Validate() error {
-	if c.SchemaVersion == "" {
-		return fmt.Errorf("schemaVersion is required")
-	}
-	if c.SchemaVersion != "v1alpha1" {
-		return fmt.Errorf("unsupported schemaVersion %q", c.SchemaVersion)
-	}
 	if c.Providers == nil {
 		c.Providers = map[string]ProviderConfig{}
 	}
@@ -190,57 +144,226 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-func (c *Config) postProcess() error {
-	for name, prov := range c.Providers {
-		updated, err := prov.decodeOptions()
-		if err != nil {
-			return fmt.Errorf("provider %q: %w", name, err)
-		}
-		c.Providers[name] = updated
-	}
-	return nil
-}
-
-func (p ProviderConfig) decodeOptions() (ProviderConfig, error) {
-	if p.Type != "proxmox" {
-		return p, nil
-	}
-	if p.Options == nil {
-		return p, nil
-	}
-	encoded, err := yaml.Marshal(p.Options)
+// LoadFromCRDs assembles the autoscaler configuration from NodeSmith CRDs.
+func LoadFromCRDs(ctx context.Context, client dynamic.Interface, namespace, controllerName string) (*Config, error) {
+	ctrlObj, err := client.
+		Resource(nodesmithv1alpha1.NodeSmithControllerGVR()).
+		Namespace(namespace).
+		Get(ctx, controllerName, metav1.GetOptions{})
 	if err != nil {
-		return p, fmt.Errorf("marshal proxmox options: %w", err)
+		return nil, fmt.Errorf("get NodeSmithController %q: %w", controllerName, err)
 	}
-	var opts ProxmoxProviderOptions
-	dec := yaml.NewDecoder(bytes.NewReader(encoded))
-	dec.KnownFields(true)
-	if err := dec.Decode(&opts); err != nil {
-		return p, fmt.Errorf("decode proxmox options: %w", err)
+
+	var controller nodesmithv1alpha1.NodeSmithController
+	if err := convertUnstructured(ctrlObj, &controller); err != nil {
+		return nil, fmt.Errorf("decode NodeSmithController %q: %w", controllerName, err)
 	}
-	p.Proxmox = &opts
-	if p.Options != nil {
-		delete(p.Options, "networkInterfaces")
-		delete(p.Options, "vmOptions")
+
+	cfg := &Config{
+		Providers: make(map[string]ProviderConfig),
+		NodePools: make([]NodePool, 0, len(controller.Spec.Pools)),
 	}
-	return p, nil
+
+	if controller.Spec.PollingInterval != nil {
+		cfg.PollingInterval = Duration{Duration: controller.Spec.PollingInterval.Duration}
+	}
+
+	if cfg.PollingInterval.Duration <= 0 {
+		cfg.PollingInterval = Duration{Duration: 30 * time.Second}
+	}
+
+	providerNames := make(map[string]struct{})
+	for _, poolName := range controller.Spec.Pools {
+		if poolName == "" {
+			return nil, fmt.Errorf("controller %q has empty pool name entry", controllerName)
+		}
+
+		poolObj, err := client.
+			Resource(nodesmithv1alpha1.NodeSmithPoolGVR()).
+			Namespace(namespace).
+			Get(ctx, poolName, metav1.GetOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("get NodeSmithPool %q: %w", poolName, err)
+		}
+
+		var pool nodesmithv1alpha1.NodeSmithPool
+		if err := convertUnstructured(poolObj, &pool); err != nil {
+			return nil, fmt.Errorf("decode NodeSmithPool %q: %w", poolName, err)
+		}
+
+		providerRef := pool.Spec.ProviderRef
+		if providerRef == "" {
+			providerRef = controller.Spec.DefaultProvider
+		}
+		if providerRef == "" {
+			return nil, fmt.Errorf("pool %q is missing providerRef and controller defaultProvider is unset", poolName)
+		}
+
+		providerNames[providerRef] = struct{}{}
+
+		cfg.NodePools = append(cfg.NodePools, convertPool(poolName, &pool.Spec, providerRef))
+	}
+
+	for name := range providerNames {
+		providerObj, err := client.
+			Resource(nodesmithv1alpha1.NodeSmithProviderGVR()).
+			Namespace(namespace).
+			Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("get NodeSmithProvider %q: %w", name, err)
+		}
+
+		var provider nodesmithv1alpha1.NodeSmithProvider
+		if err := convertUnstructured(providerObj, &provider); err != nil {
+			return nil, fmt.Errorf("decode NodeSmithProvider %q: %w", name, err)
+		}
+
+		cfgProvider, err := convertProvider(&provider.Spec)
+		if err != nil {
+			return nil, fmt.Errorf("convert NodeSmithProvider %q: %w", name, err)
+		}
+
+		cfg.Providers[name] = cfgProvider
+	}
+
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+
+	return cfg, nil
 }
 
-type ProxmoxProviderOptions struct {
-	NetworkInterfaces []ProxmoxNetworkInterface `yaml:"networkInterfaces"`
-	VMOptions         []ProxmoxOption           `yaml:"vmOptions"`
-	AdditionalOptions map[string]any            `yaml:",inline"`
+func convertUnstructured[T any](obj *unstructured.Unstructured, target *T) error {
+	if obj == nil {
+		return fmt.Errorf("nil object")
+	}
+	content := obj.UnstructuredContent()
+	return runtime.DefaultUnstructuredConverter.FromUnstructured(content, target)
 }
 
-type ProxmoxNetworkInterface struct {
-	Name      string `yaml:"name"`
-	Model     string `yaml:"model"`
-	Bridge    string `yaml:"bridge"`
-	VLANTag   int    `yaml:"vlanTag"`
-	MACPrefix string `yaml:"macPrefix"`
+func convertPool(name string, spec *nodesmithv1alpha1.NodeSmithPoolSpec, providerRef string) NodePool {
+	conv := NodePool{
+		Name:         name,
+		ProviderRef:  providerRef,
+		PoolLabelKey: spec.PoolLabelKey,
+		Limits: NodePoolLimits{
+			MinNodes:  spec.Limits.MinNodes,
+			MaxNodes:  spec.Limits.MaxNodes,
+			CPUCores:  spec.Limits.CPUCores,
+			MemoryMiB: spec.Limits.MemoryMiB,
+		},
+		MachineTemplate: MachineTemplate{
+			KubeNodeNamePrefix: spec.MachineTemplate.KubeNodeNamePrefix,
+			Architecture:       spec.MachineTemplate.Architecture,
+			Labels:             copyStringMap(spec.MachineTemplate.Labels),
+		},
+	}
+
+	if spec.ScaleUp != nil {
+		conv.ScaleUp = &ScaleUpPolicy{
+			BatchSize: spec.ScaleUp.BatchSize,
+		}
+		if spec.ScaleUp.StabilizationWindow != nil {
+			conv.ScaleUp.StabilizationWindow = &Duration{Duration: spec.ScaleUp.StabilizationWindow.Duration}
+		}
+	}
+
+	if spec.ScaleDown != nil {
+		conv.ScaleDown = &ScaleDownPolicy{
+			MaxConcurrent: spec.ScaleDown.MaxConcurrent,
+		}
+		if spec.ScaleDown.DrainTimeout != nil {
+			conv.ScaleDown.DrainTimeout = &Duration{Duration: spec.ScaleDown.DrainTimeout.Duration}
+		}
+	}
+
+	return conv
 }
 
-type ProxmoxOption struct {
-	Name  string      `yaml:"name"`
-	Value interface{} `yaml:"value"`
+func convertProvider(spec *nodesmithv1alpha1.NodeSmithProviderSpec) (ProviderConfig, error) {
+	if spec.Type == "" {
+		return ProviderConfig{}, fmt.Errorf("provider type must be specified")
+	}
+
+	cfg := ProviderConfig{
+		Type: spec.Type,
+	}
+
+	if spec.CredentialsSecretRef != nil {
+		cfg.CredentialsRef = &CredentialsRef{
+			Name:      spec.CredentialsSecretRef.Name,
+			Namespace: spec.CredentialsSecretRef.Namespace,
+		}
+	}
+
+	switch spec.Type {
+	case "proxmox":
+		if spec.Proxmox == nil {
+			return ProviderConfig{}, fmt.Errorf("proxmox provider requires spec.proxmox")
+		}
+		prox, err := convertProxmox(spec.Proxmox)
+		if err != nil {
+			return ProviderConfig{}, err
+		}
+		cfg.Proxmox = prox
+	default:
+		return ProviderConfig{}, fmt.Errorf("unsupported provider type %q", spec.Type)
+	}
+
+	return cfg, nil
+}
+
+func convertProxmox(spec *nodesmithv1alpha1.ProxmoxProviderSpec) (*ProxmoxProviderOptions, error) {
+	if spec.Endpoint == "" {
+		return nil, fmt.Errorf("proxmox endpoint is required")
+	}
+
+	opts := &ProxmoxProviderOptions{
+		Endpoint:          spec.Endpoint,
+		NodeWhitelist:     append([]string(nil), spec.NodeWhitelist...),
+		ManagedNodeTag:    spec.ManagedNodeTag,
+		VMMemOverheadMiB:  spec.VMMemOverheadMiB,
+		VMOptions:         make([]ProxmoxOption, 0, len(spec.VMOptions)),
+		NetworkInterfaces: make([]ProxmoxNetworkInterface, 0, len(spec.NetworkInterfaces)),
+	}
+
+	if spec.VMIDRange != nil {
+		opts.VMIDRange = &VMIDRange{
+			Lower: spec.VMIDRange.Lower,
+			Upper: spec.VMIDRange.Upper,
+		}
+		if opts.VMIDRange.Upper < opts.VMIDRange.Lower {
+			return nil, fmt.Errorf("proxmox vmIDRange.upper must be >= lower")
+		}
+	}
+
+	for _, nic := range spec.NetworkInterfaces {
+		opts.NetworkInterfaces = append(opts.NetworkInterfaces, ProxmoxNetworkInterface{
+			Name:      nic.Name,
+			Model:     nic.Model,
+			Bridge:    nic.Bridge,
+			VLANTag:   nic.VLANTag,
+			MACPrefix: nic.MACPrefix,
+		})
+	}
+
+	for _, opt := range spec.VMOptions {
+		opts.VMOptions = append(opts.VMOptions, ProxmoxOption{
+			Name:  opt.Name,
+			Value: opt.Value,
+		})
+	}
+
+	return opts, nil
+}
+
+func copyStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }

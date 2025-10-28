@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -22,49 +23,78 @@ import (
 
 var (
 	kubeconfigPath string
-	kubeconfigOnce sync.Once
+	restOnce       sync.Once
+	restConfig     *rest.Config
+	restErr        error
 )
 
-func initKubeconfigFlag() {
+func init() {
 	defaultPath := ""
 	if home := homedir.HomeDir(); home != "" {
 		defaultPath = filepath.Join(home, ".kube", "config")
 	}
 	flag.StringVar(&kubeconfigPath, "kubeconfig", defaultPath, "(optional) absolute path to the kubeconfig file")
-	flag.Parse()
 }
 
-func GetClientset() *kubernetes.Clientset {
-	kubeconfigOnce.Do(initKubeconfigFlag)
+func tryExplicitKubeconfig() (*rest.Config, error) {
+	if kubeconfigPath == "" {
+		return nil, fmt.Errorf("kubeconfig path not set")
+	}
+	if _, err := os.Stat(kubeconfigPath); err != nil {
+		return nil, err
+	}
+	return clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+}
 
-	var (
-		config *rest.Config
-		err    error
-	)
-
-	if kubeconfigPath != "" {
-		if _, statErr := os.Stat(kubeconfigPath); statErr == nil {
-			config, err = clientcmd.BuildConfigFromFlags("", kubeconfigPath)
-			if err != nil {
-				panic(fmt.Errorf("failed to load kubeconfig %s: %w", kubeconfigPath, err))
-			}
-		}
+func loadRESTConfig() {
+	sources := []func() (*rest.Config, error){
+		tryExplicitKubeconfig,
+		rest.InClusterConfig,
+		func() (*rest.Config, error) {
+			return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+				clientcmd.NewDefaultClientConfigLoadingRules(),
+				&clientcmd.ConfigOverrides{},
+			).ClientConfig()
+		},
 	}
 
-	if config == nil {
-		config, err = rest.InClusterConfig()
+	for _, src := range sources {
+		cfg, err := src()
 		if err != nil {
-			panic(fmt.Errorf("failed to create in-cluster config: %w", err))
+			restErr = err
+			continue
 		}
+		restConfig = cfg
+		restErr = nil
+		return
 	}
+}
 
-	// create the clientset
-	clientset, err := kubernetes.NewForConfig(config)
+// GetRESTConfig returns a shared REST config derived from in-cluster or kubeconfig settings.
+func GetRESTConfig() (*rest.Config, error) {
+	restOnce.Do(loadRESTConfig)
+	if restErr != nil {
+		return nil, restErr
+	}
+	return restConfig, nil
+}
+
+// GetClientset returns a typed Kubernetes clientset using the shared REST config.
+func GetClientset() (*kubernetes.Clientset, error) {
+	cfg, err := GetRESTConfig()
 	if err != nil {
-		panic(err.Error())
+		return nil, err
 	}
+	return kubernetes.NewForConfig(cfg)
+}
 
-	return clientset
+// GetDynamicClient returns a dynamic client using the shared REST config.
+func GetDynamicClient() (dynamic.Interface, error) {
+	cfg, err := GetRESTConfig()
+	if err != nil {
+		return nil, err
+	}
+	return dynamic.NewForConfig(cfg)
 }
 
 func PrintNodes(nodes []corev1.Node) {

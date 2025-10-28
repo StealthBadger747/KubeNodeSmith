@@ -1,6 +1,8 @@
 *.sw?
 .direnv
 .gopath
+.gocache
+.gomodcache
 .env
 /.envrc
 /direnv
@@ -13,4 +15,4 @@
 # for context: https://github.com/Homebrew/homebrew-bundle/pull/552
 Brewfile.lock.json
 
-nodesmith
+/nodesmith
