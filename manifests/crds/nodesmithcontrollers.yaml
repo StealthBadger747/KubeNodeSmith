@@ -24,6 +24,7 @@ spec:
               properties:
                 pollingInterval:
                   type: string
+                  default: "30s"
                 pools:
                   type: array
                   items:
@@ -43,6 +44,7 @@ spec:
                   format: date-time
                 conditions:
                   type: array
+                  minItems: 1
                   items:
                     type: object
                     required:

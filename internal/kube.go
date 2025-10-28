@@ -468,7 +468,7 @@ func getAllPodsOnNode(ctx context.Context, clientset *kubernetes.Clientset, node
 	return pods, nil
 }
 
-func GetScaleDownCandiates(ctx context.Context, clientset *kubernetes.Clientset, nodePrefix string, nodepoolKey string, nodepoolValue string) ([]corev1.Node, error) {
+func GetScaleDownCandidates(ctx context.Context, clientset *kubernetes.Clientset, nodePrefix string, nodepoolKey string, nodepoolValue string) ([]corev1.Node, error) {
 	nodes, err := GetNodesByLabel(ctx, clientset, nodepoolKey, nodepoolValue) //clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, err

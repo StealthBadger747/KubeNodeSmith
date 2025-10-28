@@ -3,7 +3,6 @@ package proxmox
 import (
 	"context"
 	"crypto/tls"
-	"flag"
 	"fmt"
 	"math/rand/v2"
 	"net/http"
@@ -13,13 +12,11 @@ import (
 
 	proxmoxapi "github.com/luthermonson/go-proxmox"
 
+	kube "github.com/StealthBadger747/KubeNodeSmith/internal"
 	"github.com/StealthBadger747/KubeNodeSmith/internal/config"
 	"github.com/StealthBadger747/KubeNodeSmith/internal/provider"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 )
 
 // Options captures provider-scoped configuration decoded from NodeSmithProvider resources.
@@ -199,38 +196,13 @@ func parseOptions(cfg config.ProviderConfig) (Options, error) {
 	return opts, nil
 }
 
-func buildRESTConfig() (*rest.Config, error) {
-	if cfg, err := rest.InClusterConfig(); err == nil {
-		return cfg, nil
-	}
-
-	var kubeconfigPath string
-	if f := flag.Lookup("kubeconfig"); f != nil {
-		kubeconfigPath = f.Value.String()
-	}
-
-	if kubeconfigPath != "" {
-		return clientcmd.BuildConfigFromFlags("", kubeconfigPath)
-	}
-
-	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-		clientcmd.NewDefaultClientConfigLoadingRules(),
-		&clientcmd.ConfigOverrides{},
-	).ClientConfig()
-}
-
 // loadCredentials fetches and validates the credentials referenced by ref.
 func loadCredentials(ctx context.Context, ref *config.CredentialsRef) (Credentials, error) {
 	if ref == nil {
 		return Credentials{}, fmt.Errorf("credentialsRef is required")
 	}
 
-	restCfg, err := buildRESTConfig()
-	if err != nil {
-		return Credentials{}, fmt.Errorf("build kubernetes config: %w", err)
-	}
-
-	clientset, err := kubernetes.NewForConfig(restCfg)
+	clientset, err := kube.GetClientset()
 	if err != nil {
 		return Credentials{}, fmt.Errorf("create kubernetes client: %w", err)
 	}

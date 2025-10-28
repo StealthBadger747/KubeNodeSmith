@@ -11,10 +11,22 @@ spec:
     kind: NodeSmithProvider
     shortNames:
       - nsp
+  additionalPrinterColumns:
+    - name: Type
+      type: string
+      jsonPath: .spec.type
+    - name: Endpoint
+      type: string
+      jsonPath: .spec.proxmox.endpoint
+    - name: Age
+      type: date
+      jsonPath: .metadata.creationTimestamp
   versions:
     - name: v1alpha1
       served: true
       storage: true
+      subresources:
+        status: {}
       schema:
         openAPIV3Schema:
           type: object
@@ -23,11 +35,15 @@ spec:
               type: object
               required:
                 - type
+                - credentialsSecretRef
               properties:
                 type:
                   type: string
                 credentialsSecretRef:
                   type: object
+                  required:
+                    - name
+                    - namespace
                   properties:
                     name:
                       type: string
