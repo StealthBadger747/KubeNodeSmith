@@ -11,23 +11,23 @@ spec:
     kind: NodeSmithPool
     shortNames:
       - nspool
-  additionalPrinterColumns:
-    - name: Provider
-      type: string
-      jsonPath: .spec.providerRef
-    - name: Min
-      type: integer
-      jsonPath: .spec.limits.minNodes
-    - name: Max
-      type: integer
-      jsonPath: .spec.limits.maxNodes
-    - name: Age
-      type: date
-      jsonPath: .metadata.creationTimestamp
   versions:
     - name: v1alpha1
       served: true
       storage: true
+      additionalPrinterColumns:
+        - name: Provider
+          type: string
+          jsonPath: .spec.providerRef
+        - name: Min
+          type: integer
+          jsonPath: .spec.limits.minNodes
+        - name: Max
+          type: integer
+          jsonPath: .spec.limits.maxNodes
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
       subresources:
         status: {}
       schema:

@@ -11,20 +11,20 @@ spec:
     kind: NodeSmithProvider
     shortNames:
       - nsp
-  additionalPrinterColumns:
-    - name: Type
-      type: string
-      jsonPath: .spec.type
-    - name: Endpoint
-      type: string
-      jsonPath: .spec.proxmox.endpoint
-    - name: Age
-      type: date
-      jsonPath: .metadata.creationTimestamp
   versions:
     - name: v1alpha1
       served: true
       storage: true
+      additionalPrinterColumns:
+        - name: Type
+          type: string
+          jsonPath: .spec.type
+        - name: Endpoint
+          type: string
+          jsonPath: .spec.proxmox.endpoint
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
       subresources:
         status: {}
       schema:
