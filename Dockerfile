@@ -9,6 +9,7 @@ RUN go mod download
 
 COPY cmd ./cmd
 COPY internal ./internal
+COPY apis ./apis
 
 RUN CGO_ENABLED=0 \
     go build -trimpath -ldflags='-s -w' -o /out/nodesmith ./cmd/nodesmith.go
