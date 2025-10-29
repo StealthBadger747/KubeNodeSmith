@@ -1,10 +1,8 @@
 package proxmox
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
-	"flag"
 	"fmt"
 	"math/rand/v2"
 	"net/http"
@@ -14,18 +12,14 @@ import (
 
 	proxmoxapi "github.com/luthermonson/go-proxmox"
 
+	kube "github.com/StealthBadger747/KubeNodeSmith/internal"
 	"github.com/StealthBadger747/KubeNodeSmith/internal/config"
 	"github.com/StealthBadger747/KubeNodeSmith/internal/provider"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
-
-	"gopkg.in/yaml.v3"
 )
 
-// Options captures provider-scoped configuration decoded from config.ProviderConfig.Options.
+// Options captures provider-scoped configuration decoded from NodeSmithProvider resources.
 type Options struct {
 	Endpoint         string
 	NodeWhitelist    []string
@@ -172,75 +166,34 @@ func parseOptions(cfg config.ProviderConfig) (Options, error) {
 	if cfg.Type != "proxmox" {
 		return Options{}, fmt.Errorf("expected proxmox provider config")
 	}
-	if cfg.Options == nil {
-		return Options{}, fmt.Errorf("proxmox provider options are required")
-	}
 	if cfg.Proxmox == nil {
-		return Options{}, fmt.Errorf("proxmox provider vmOptions are required")
-	}
-
-	encoded, err := yaml.Marshal(cfg.Options)
-	if err != nil {
-		return Options{}, fmt.Errorf("marshal proxmox options: %w", err)
-	}
-
-	var spec struct {
-		Endpoint      string   `yaml:"endpoint"`
-		NodeWhitelist []string `yaml:"nodeWhitelist"`
-		VMIDRange     *struct {
-			Lower int64 `yaml:"lower"`
-			Upper int64 `yaml:"upper"`
-		} `yaml:"vmIDRange"`
-		VMMemOverheadMiB int64  `yaml:"vmMemOverheadMiB"`
-		ManagedNodeTag   string `yaml:"managedNodeTag"`
-	}
-
-	dec := yaml.NewDecoder(bytes.NewReader(encoded))
-	dec.KnownFields(true)
-	if err := dec.Decode(&spec); err != nil {
-		return Options{}, fmt.Errorf("decode proxmox options: %w", err)
-	}
-
-	if spec.Endpoint == "" {
-		return Options{}, fmt.Errorf("proxmox option endpoint is required")
+		return Options{}, fmt.Errorf("proxmox provider configuration is required")
 	}
 
 	opts := Options{
-		Endpoint:         spec.Endpoint,
-		NodeWhitelist:    append([]string(nil), spec.NodeWhitelist...),
-		VMMemOverheadMiB: spec.VMMemOverheadMiB,
-		managedNodeTag:   spec.ManagedNodeTag,
+		Endpoint:         cfg.Proxmox.Endpoint,
+		NodeWhitelist:    append([]string(nil), cfg.Proxmox.NodeWhitelist...),
+		VMMemOverheadMiB: cfg.Proxmox.VMMemOverheadMiB,
+		managedNodeTag:   cfg.Proxmox.ManagedNodeTag,
 	}
 
-	if spec.VMIDRange != nil {
-		if spec.VMIDRange.Lower > spec.VMIDRange.Upper {
-			return Options{}, fmt.Errorf("proxmox option vmIDRange.lower must be <= upper")
-		}
-		opts.VMIDRange = VMIDRange{Lower: uint64(spec.VMIDRange.Lower), Upper: uint64(spec.VMIDRange.Upper)}
+	if opts.Endpoint == "" {
+		return Options{}, fmt.Errorf("proxmox endpoint is required")
+	}
+
+	if cfg.Proxmox.VMIDRange == nil {
+		return Options{}, fmt.Errorf("proxmox vmIDRange is required")
+	}
+	if cfg.Proxmox.VMIDRange.Lower > cfg.Proxmox.VMIDRange.Upper {
+		return Options{}, fmt.Errorf("proxmox vmIDRange.lower must be <= upper")
+	}
+	opts.VMIDRange = VMIDRange{
+		Lower: uint64(cfg.Proxmox.VMIDRange.Lower),
+		Upper: uint64(cfg.Proxmox.VMIDRange.Upper),
 	}
 
 	opts.Proxmox = cfg.Proxmox
 	return opts, nil
-}
-
-func buildRESTConfig() (*rest.Config, error) {
-	if cfg, err := rest.InClusterConfig(); err == nil {
-		return cfg, nil
-	}
-
-	var kubeconfigPath string
-	if f := flag.Lookup("kubeconfig"); f != nil {
-		kubeconfigPath = f.Value.String()
-	}
-
-	if kubeconfigPath != "" {
-		return clientcmd.BuildConfigFromFlags("", kubeconfigPath)
-	}
-
-	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-		clientcmd.NewDefaultClientConfigLoadingRules(),
-		&clientcmd.ConfigOverrides{},
-	).ClientConfig()
 }
 
 // loadCredentials fetches and validates the credentials referenced by ref.
@@ -249,12 +202,7 @@ func loadCredentials(ctx context.Context, ref *config.CredentialsRef) (Credentia
 		return Credentials{}, fmt.Errorf("credentialsRef is required")
 	}
 
-	restCfg, err := buildRESTConfig()
-	if err != nil {
-		return Credentials{}, fmt.Errorf("build kubernetes config: %w", err)
-	}
-
-	clientset, err := kubernetes.NewForConfig(restCfg)
+	clientset, err := kube.GetClientset()
 	if err != nil {
 		return Credentials{}, fmt.Errorf("create kubernetes client: %w", err)
 	}

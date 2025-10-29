@@ -70,7 +70,7 @@ func checkPoolLimits(poolUsage *kube.PoolResourceUsage, limits *cfgpkg.NodePoolL
 }
 
 // deleteNode handles the complete node deletion process including cordon, pod eviction check, and machine deprovisioning
-func deleteNode(ctx context.Context, cs *kubernetes.Clientset, provider proxprovider.Provider, nodeName string) error {
+func deleteNode(ctx context.Context, cs *kubernetes.Clientset, provider *proxprovider.Provider, nodeName string) error {
 	fmt.Printf("Deleting node `%s`\n", nodeName)
 
 	node, err := cs.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
@@ -100,11 +100,6 @@ func deleteNode(ctx context.Context, cs *kubernetes.Clientset, provider proxprov
 		return fmt.Errorf("node %s not empty (has %d evictable pods), skipping deletion", nodeName, len(evictable))
 	}
 
-	// Delete the node object
-	if err := cs.CoreV1().Nodes().Delete(ctx, nodeName, metav1.DeleteOptions{}); err != nil {
-		return fmt.Errorf("deleting node object %s: %w", nodeName, err)
-	}
-
 	// Deprovision the machine
 	if err := provider.DeprovisionMachine(ctx, providerpkg.Machine{
 		KubeNodeName: nodeName,
@@ -112,12 +107,17 @@ func deleteNode(ctx context.Context, cs *kubernetes.Clientset, provider proxprov
 		return fmt.Errorf("deprovisioning machine %s: %w", nodeName, err)
 	}
 
+	// Delete the node object
+	if err := cs.CoreV1().Nodes().Delete(ctx, nodeName, metav1.DeleteOptions{}); err != nil {
+		return fmt.Errorf("deleting node object %s: %w", nodeName, err)
+	}
+
 	fmt.Printf("Successfully deleted node `%s`\n", nodeName)
 	return nil
 }
 
 // Reconciler looks for nodes that are orphaned (missing pool label) and deletes them
-func reconciler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgpkg.NodePool, provider proxprovider.Provider) {
+func reconciler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgpkg.NodePool, provider *proxprovider.Provider) {
 	fmt.Printf("Reconciling nodepool %q", nodepoolCfg.Name)
 
 	nodesInPool, err := cs.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
@@ -154,7 +154,7 @@ func reconciler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgp
 	}
 }
 
-func scaler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgpkg.NodePool, provider proxprovider.Provider) error {
+func scaler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgpkg.NodePool, provider *proxprovider.Provider) error {
 	pods, err := kube.GetUnschedulablePods(ctx, cs)
 	if err != nil {
 		return fmt.Errorf("get unschedulable pods: %w", err)
@@ -251,7 +251,7 @@ func scaler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgpkg.N
 			return nil
 		}
 
-		nodes, err := kube.GetScaleDownCandiates(ctx, cs, nodepoolCfg.MachineTemplate.KubeNodeNamePrefix, nodepoolCfg.GetPoolLabelKey(), nodepoolCfg.Name)
+		nodes, err := kube.GetScaleDownCandidates(ctx, cs, nodepoolCfg.MachineTemplate.KubeNodeNamePrefix, nodepoolCfg.GetPoolLabelKey(), nodepoolCfg.Name)
 		if err != nil {
 			return fmt.Errorf("get scale down candidates: %w", err)
 		}
@@ -268,17 +268,41 @@ func scaler(ctx context.Context, cs *kubernetes.Clientset, nodepoolCfg *cfgpkg.N
 }
 
 func main() {
-	var configPath string
-	flag.StringVar(&configPath, "config", os.Getenv("SCALER_CONFIG_PATH"), "path to scaler config")
-	flag.Parse()
-
-	if configPath == "" {
-		log.Fatal("config path must be provided via --config or SCALER_CONFIG_PATH")
+	defaultNamespace := os.Getenv("NODESMITH_NAMESPACE")
+	if defaultNamespace == "" {
+		defaultNamespace = "kubenodesmith"
 	}
 
-	cfg, err := cfgpkg.Load(configPath)
+	controllerNameDefault := os.Getenv("NODESMITH_CONTROLLER")
+
+	var (
+		controllerName      string
+		controllerNamespace string
+	)
+
+	flag.StringVar(&controllerName, "controller-name", controllerNameDefault, "name of the NodeSmithController resource to manage")
+	flag.StringVar(&controllerNamespace, "controller-namespace", defaultNamespace, "namespace containing NodeSmith resources")
+	flag.Parse()
+
+	if controllerName == "" {
+		log.Fatal("controller name must be provided via --controller-name or NODESMITH_CONTROLLER")
+	}
+
+	ctx := context.Background()
+
+	dynamicClient, err := kube.GetDynamicClient()
 	if err != nil {
-		log.Fatalf("load config: %v", err)
+		log.Fatalf("create dynamic client: %v", err)
+	}
+
+	cfg, err := cfgpkg.LoadFromCRDs(ctx, dynamicClient, controllerNamespace, controllerName)
+	if err != nil {
+		log.Fatalf("load config from CRDs: %v", err)
+	}
+
+	clientset, err := kube.GetClientset()
+	if err != nil {
+		log.Fatalf("create kubernetes clientset: %v", err)
 	}
 
 	pollInterval := cfg.PollingInterval.AsDuration()
@@ -289,7 +313,6 @@ func main() {
 		log.Printf("polling interval set to %s", pollInterval)
 	}
 
-	ctx := context.Background()
 	providers := make(map[string]*proxprovider.Provider)
 	for name, providerCfg := range cfg.Providers {
 		if providerCfg.Type != "proxmox" {
@@ -316,17 +339,19 @@ func main() {
 		fmt.Printf("\n--------------------------------\n")
 		fmt.Printf("Starting scaling loop at %s\n", time.Now().Format(time.RFC3339))
 
-		for _, np := range cfg.NodePools {
+		for idx := range cfg.NodePools {
+			np := &cfg.NodePools[idx]
+
 			prov, ok := providers[np.ProviderRef]
 			if !ok {
 				log.Fatalf("provider %s not found for nodepool", np.ProviderRef)
 			}
 
 			if i%5 == 0 {
-				reconciler(ctx, kube.GetClientset(), &np, *prov)
+				reconciler(ctx, clientset, np, prov)
 				i = 0
 			} else {
-				if err := scaler(ctx, kube.GetClientset(), &np, *prov); err != nil {
+				if err := scaler(ctx, clientset, np, prov); err != nil {
 					fmt.Fprintf(os.Stderr, "scaler error for pool %s: %v\n", np.Name, err)
 				}
 			}
