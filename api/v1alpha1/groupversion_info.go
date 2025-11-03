@@ -1,6 +1,6 @@
 // Package v1alpha1 contains API Schema definitions for the kubenodesmith v1alpha1 API group.
 // +kubebuilder:object:generate=true
-// +groupName=kubenodesmith.kubenodesmith.parawell.cloud
+// +groupName=kubenodesmith.parawell.cloud
 package v1alpha1
 
 import (
@@ -10,7 +10,7 @@ import (
 
 var (
 	// GroupVersion is group version used to register these objects.
-	GroupVersion = schema.GroupVersion{Group: "kubenodesmith.kubenodesmith.parawell.cloud", Version: "v1alpha1"}
+	GroupVersion = schema.GroupVersion{Group: "kubenodesmith.parawell.cloud", Version: "v1alpha1"}
 
 	// SchemeBuilder is used to add go types to the GroupVersionKind scheme.
 	SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}

@@ -3,7 +3,7 @@
 # and allow the plugins properly work.
 # More info: https://book.kubebuilder.io/reference/project-config.html
 cliVersion: v4.9.0
-domain: kubenodesmith.parawell.cloud
+domain: parawell.cloud
 layout:
 - go.kubebuilder.io/v4
 projectName: kubenodesmith
@@ -13,7 +13,7 @@ resources:
     crdVersion: v1
     namespaced: true
   controller: true
-  domain: kubenodesmith.parawell.cloud
+  domain: parawell.cloud
   group: kubenodesmith
   kind: NodeSmithControlPlane
   path: github.com/StealthBadger747/KubeNodeSmith/api/v1alpha1
@@ -22,7 +22,7 @@ resources:
     crdVersion: v1
     namespaced: true
   controller: false
-  domain: kubenodesmith.parawell.cloud
+  domain: parawell.cloud
   group: kubenodesmith
   kind: NodeSmithProvider
   path: github.com/StealthBadger747/KubeNodeSmith/api/v1alpha1
@@ -31,7 +31,7 @@ resources:
     crdVersion: v1
     namespaced: true
   controller: true
-  domain: kubenodesmith.parawell.cloud
+  domain: parawell.cloud
   group: kubenodesmith
   kind: NodeSmithPool
   path: github.com/StealthBadger747/KubeNodeSmith/api/v1alpha1
@@ -40,7 +40,7 @@ resources:
     crdVersion: v1
     namespaced: true
   controller: true
-  domain: kubenodesmith.parawell.cloud
+  domain: parawell.cloud
   group: kubenodesmith
   kind: NodeSmithClaim
   path: github.com/StealthBadger747/KubeNodeSmith/api/v1alpha1

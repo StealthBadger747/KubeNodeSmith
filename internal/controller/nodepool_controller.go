@@ -36,10 +36,10 @@ type NodePoolReconciler struct {
 	Recorder record.EventRecorder
 }
 
-// +kubebuilder:rbac:groups=kubenodesmith.kubenodesmith.parawell.cloud,resources=nodesmithpools,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=kubenodesmith.kubenodesmith.parawell.cloud,resources=nodesmithpools/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=kubenodesmith.kubenodesmith.parawell.cloud,resources=nodesmithpools/finalizers,verbs=update
-// +kubebuilder:rbac:groups=kubenodesmith.kubenodesmith.parawell.cloud,resources=nodesmithclaims,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=kubenodesmith.parawell.cloud,resources=nodesmithpools,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=kubenodesmith.parawell.cloud,resources=nodesmithpools/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=kubenodesmith.parawell.cloud,resources=nodesmithpools/finalizers,verbs=update
+// +kubebuilder:rbac:groups=kubenodesmith.parawell.cloud,resources=nodesmithclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch

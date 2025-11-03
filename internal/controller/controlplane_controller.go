@@ -42,9 +42,9 @@ type ControlPlaneReconciler struct {
 	providerCache map[types.NamespacedName]providerCacheEntry
 }
 
-// +kubebuilder:rbac:groups=kubenodesmith.kubenodesmith.parawell.cloud,resources=nodesmithcontrolplanes,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=kubenodesmith.kubenodesmith.parawell.cloud,resources=nodesmithcontrolplanes/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=kubenodesmith.kubenodesmith.parawell.cloud,resources=nodesmithcontrolplanes/finalizers,verbs=update
+// +kubebuilder:rbac:groups=kubenodesmith.parawell.cloud,resources=nodesmithcontrolplanes,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=kubenodesmith.parawell.cloud,resources=nodesmithcontrolplanes/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=kubenodesmith.parawell.cloud,resources=nodesmithcontrolplanes/finalizers,verbs=update
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.

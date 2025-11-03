@@ -52,12 +52,11 @@ rules:
   - get
   - list
 - apiGroups:
-  - kubenodesmith.kubenodesmith.parawell.cloud
+  - kubenodesmith.parawell.cloud
   resources:
   - nodesmithclaims
   - nodesmithcontrolplanes
   - nodesmithpools
-  - nodesmithproviders
   verbs:
   - create
   - delete
@@ -67,25 +66,30 @@ rules:
   - update
   - watch
 - apiGroups:
-  - kubenodesmith.kubenodesmith.parawell.cloud
+  - kubenodesmith.parawell.cloud
   resources:
   - nodesmithclaims/finalizers
   - nodesmithcontrolplanes/finalizers
   - nodesmithpools/finalizers
-  - nodesmithproviders/finalizers
   verbs:
   - update
 - apiGroups:
-  - kubenodesmith.kubenodesmith.parawell.cloud
+  - kubenodesmith.parawell.cloud
   resources:
   - nodesmithclaims/status
   - nodesmithcontrolplanes/status
   - nodesmithpools/status
-  - nodesmithproviders/status
   verbs:
   - get
   - patch
   - update
+- apiGroups:
+  - kubenodesmith.parawell.cloud
+  resources:
+  - nodesmithproviders
+  verbs:
+  - get
+  - list
 - apiGroups:
   - storage.k8s.io
   resources:

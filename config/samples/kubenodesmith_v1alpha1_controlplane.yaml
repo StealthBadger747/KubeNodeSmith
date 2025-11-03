@@ -1,4 +1,4 @@
-apiVersion: kubenodesmith.kubenodesmith.parawell.cloud/v1alpha1
+apiVersion: kubenodesmith.parawell.cloud/v1alpha1
 kind: NodeSmithControlPlane
 metadata:
   labels:
