@@ -21,7 +21,7 @@ resources:
 - api:
     crdVersion: v1
     namespaced: true
-  controller: true
+  controller: false
   domain: kubenodesmith.parawell.cloud
   group: kubenodesmith
   kind: NodeSmithProvider
