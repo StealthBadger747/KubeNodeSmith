@@ -1,0 +1,95 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - ""
+  resources:
+  - pods/eviction
+  verbs:
+  - create
+- apiGroups:
+  - apps
+  resources:
+  - statefulsets
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - apps
+  - extensions
+  resources:
+  - daemonsets
+  - replicasets
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - kubenodesmith.kubenodesmith.parawell.cloud
+  resources:
+  - nodesmithclaims
+  - nodesmithcontrolplanes
+  - nodesmithpools
+  - nodesmithproviders
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - kubenodesmith.kubenodesmith.parawell.cloud
+  resources:
+  - nodesmithclaims/finalizers
+  - nodesmithcontrolplanes/finalizers
+  - nodesmithpools/finalizers
+  - nodesmithproviders/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - kubenodesmith.kubenodesmith.parawell.cloud
+  resources:
+  - nodesmithclaims/status
+  - nodesmithcontrolplanes/status
+  - nodesmithpools/status
+  - nodesmithproviders/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - storage.k8s.io
+  resources:
+  - volumeattachments
+  verbs:
+  - get
+  - list
