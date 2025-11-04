@@ -1,0 +1,7 @@
+## Append samples of your project ##
+resources:
+- kubenodesmith_v1alpha1_controlplane.yaml
+- kubenodesmith_v1alpha1_nodesmithprovider.yaml
+- kubenodesmith_v1alpha1_nodesmithpool.yaml
+- kubenodesmith_v1alpha1_nodesmithclaim.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

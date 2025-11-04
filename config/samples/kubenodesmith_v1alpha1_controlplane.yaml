@@ -1,0 +1,8 @@
+apiVersion: kubenodesmith.parawell.cloud/v1alpha1
+kind: NodeSmithControlPlane
+metadata:
+  name: kubenodesmith
+  namespace: kubenodesmith
+spec:
+  pools:
+    - proxmox-small

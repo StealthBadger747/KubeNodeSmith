@@ -1,0 +1,20 @@
+apiVersion: kubenodesmith.parawell.cloud/v1alpha1
+kind: NodeSmithPool
+metadata:
+  name: proxmox-small
+  namespace: kubenodesmith
+spec:
+  providerRef: proxmox-production
+  limits:
+    minNodes: 0
+    maxNodes: 5
+    cpuCores: 0
+    memoryMiB: 30720
+  machineTemplate:
+    kubeNodeNamePrefix: zagato-worker-auto
+    labels:
+      node-role.kubernetes.io/worker: ""
+  scaleUp:
+    stabilizationWindow: 2m
+  scaleDown:
+    stabilizationWindow: 5m

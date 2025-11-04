@@ -10,12 +10,12 @@ import (
 	"strconv"
 	"strings"
 
+	kubenodesmithv1alpha1 "github.com/StealthBadger747/KubeNodeSmith/api/v1alpha1"
+	kube "github.com/StealthBadger747/KubeNodeSmith/internal/kube"
+	"github.com/StealthBadger747/KubeNodeSmith/internal/provider"
 	proxmoxapi "github.com/luthermonson/go-proxmox"
 
-	kube "github.com/StealthBadger747/KubeNodeSmith/internal"
-	"github.com/StealthBadger747/KubeNodeSmith/internal/config"
-	"github.com/StealthBadger747/KubeNodeSmith/internal/provider"
-
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -26,7 +26,7 @@ type Options struct {
 	VMIDRange        VMIDRange
 	VMMemOverheadMiB int64
 	managedNodeTag   string
-	Proxmox          *config.ProxmoxProviderOptions
+	Proxmox          *kubenodesmithv1alpha1.ProxmoxProviderSpec
 }
 
 // VMIDRange describes the inclusive lower/upper bounds allowed for new VMs.
@@ -48,19 +48,11 @@ type Provider struct {
 	opts   Options
 }
 
+const proxmoxStatusOnline = "online"
+
 // Endpoint returns the API endpoint configured for this provider.
 func (p *Provider) Endpoint() string {
 	return p.opts.Endpoint
-}
-
-func printNodes(nodeStatuses []*proxmoxapi.NodeStatus) {
-	for _, status := range nodeStatuses {
-		fmt.Printf("Node: %s, Status: %s,  Uptime: %d\n",
-			status.Node,
-			status.Status,
-			status.Uptime,
-		)
-	}
 }
 
 func generateNewVMID(clusterResources proxmoxapi.ClusterResources, opts Options) (int, error) {
@@ -131,13 +123,17 @@ func generateRandomMAC(prefix string) string {
 // NewProvider constructs a Proxmox-backed provider instance. It is expected to be called by the
 // autoscaler during startup. Secrets needed for authentication should already be resolved by the
 // caller and passed in via creds.
-func NewProvider(ctx context.Context, cfg config.ProviderConfig) (*Provider, error) {
-	parsedOpts, err := parseOptions(cfg)
+func NewProvider(ctx context.Context, providerResource *kubenodesmithv1alpha1.NodeSmithProvider) (*Provider, error) {
+	if providerResource == nil {
+		return nil, fmt.Errorf("provider resource is required")
+	}
+
+	parsedOpts, err := parseOptions(providerResource.Spec)
 	if err != nil {
 		return nil, fmt.Errorf("parse proxmox options: %w", err)
 	}
 
-	creds, err := loadCredentials(ctx, cfg.CredentialsRef)
+	creds, err := loadCredentials(ctx, providerResource.Namespace, providerResource.Spec.CredentialsSecretRef)
 	if err != nil {
 		return nil, err
 	}
@@ -162,44 +158,55 @@ func NewProvider(ctx context.Context, cfg config.ProviderConfig) (*Provider, err
 }
 
 // parseOptions converts the generic map of provider options into a strongly typed Options struct.
-func parseOptions(cfg config.ProviderConfig) (Options, error) {
-	if cfg.Type != "proxmox" {
+func parseOptions(spec kubenodesmithv1alpha1.NodeSmithProviderSpec) (Options, error) {
+	if spec.Type != "proxmox" {
 		return Options{}, fmt.Errorf("expected proxmox provider config")
 	}
-	if cfg.Proxmox == nil {
+	if spec.Proxmox == nil {
 		return Options{}, fmt.Errorf("proxmox provider configuration is required")
 	}
 
 	opts := Options{
-		Endpoint:         cfg.Proxmox.Endpoint,
-		NodeWhitelist:    append([]string(nil), cfg.Proxmox.NodeWhitelist...),
-		VMMemOverheadMiB: cfg.Proxmox.VMMemOverheadMiB,
-		managedNodeTag:   cfg.Proxmox.ManagedNodeTag,
+		Endpoint:         spec.Proxmox.Endpoint,
+		NodeWhitelist:    append([]string(nil), spec.Proxmox.NodeWhitelist...),
+		VMMemOverheadMiB: spec.Proxmox.VMMemOverheadMiB,
+		managedNodeTag:   spec.Proxmox.ManagedNodeTag,
 	}
 
 	if opts.Endpoint == "" {
 		return Options{}, fmt.Errorf("proxmox endpoint is required")
 	}
 
-	if cfg.Proxmox.VMIDRange == nil {
+	if spec.Proxmox.VMIDRange == nil {
 		return Options{}, fmt.Errorf("proxmox vmIDRange is required")
 	}
-	if cfg.Proxmox.VMIDRange.Lower > cfg.Proxmox.VMIDRange.Upper {
+	if spec.Proxmox.VMIDRange.Lower > spec.Proxmox.VMIDRange.Upper {
 		return Options{}, fmt.Errorf("proxmox vmIDRange.lower must be <= upper")
 	}
 	opts.VMIDRange = VMIDRange{
-		Lower: uint64(cfg.Proxmox.VMIDRange.Lower),
-		Upper: uint64(cfg.Proxmox.VMIDRange.Upper),
+		Lower: uint64(spec.Proxmox.VMIDRange.Lower),
+		Upper: uint64(spec.Proxmox.VMIDRange.Upper),
 	}
 
-	opts.Proxmox = cfg.Proxmox
+	opts.Proxmox = spec.Proxmox
 	return opts, nil
 }
 
 // loadCredentials fetches and validates the credentials referenced by ref.
-func loadCredentials(ctx context.Context, ref *config.CredentialsRef) (Credentials, error) {
+func loadCredentials(ctx context.Context, defaultNamespace string, ref *corev1.SecretReference) (Credentials, error) {
 	if ref == nil {
-		return Credentials{}, fmt.Errorf("credentialsRef is required")
+		return Credentials{}, fmt.Errorf("credentialsSecretRef is required")
+	}
+
+	namespace := ref.Namespace
+	if namespace == "" {
+		namespace = defaultNamespace
+	}
+	if namespace == "" {
+		return Credentials{}, fmt.Errorf("credentialsSecretRef namespace is required")
+	}
+	if ref.Name == "" {
+		return Credentials{}, fmt.Errorf("credentialsSecretRef name is required")
 	}
 
 	clientset, err := kube.GetClientset()
@@ -207,19 +214,19 @@ func loadCredentials(ctx context.Context, ref *config.CredentialsRef) (Credentia
 		return Credentials{}, fmt.Errorf("create kubernetes client: %w", err)
 	}
 
-	secret, err := clientset.CoreV1().Secrets(ref.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
+	secret, err := clientset.CoreV1().Secrets(namespace).Get(ctx, ref.Name, metav1.GetOptions{})
 	if err != nil {
-		return Credentials{}, fmt.Errorf("fetch secret %s/%s: %w", ref.Namespace, ref.Name, err)
+		return Credentials{}, fmt.Errorf("fetch secret %s/%s: %w", namespace, ref.Name, err)
 	}
 
 	tokenID := strings.TrimSpace(string(secret.Data["PROXMOX_TOKEN_ID"]))
 	if tokenID == "" {
-		return Credentials{}, fmt.Errorf("secret %s/%s missing PROXMOX_TOKEN_ID", ref.Namespace, ref.Name)
+		return Credentials{}, fmt.Errorf("secret %s/%s missing PROXMOX_TOKEN_ID", namespace, ref.Name)
 	}
 
 	secretValue := strings.TrimSpace(string(secret.Data["PROXMOX_SECRET"]))
 	if secretValue == "" {
-		return Credentials{}, fmt.Errorf("secret %s/%s missing PROXMOX_SECRET", ref.Namespace, ref.Name)
+		return Credentials{}, fmt.Errorf("secret %s/%s missing PROXMOX_SECRET", namespace, ref.Name)
 	}
 
 	insecure := false
@@ -228,7 +235,7 @@ func loadCredentials(ctx context.Context, ref *config.CredentialsRef) (Credentia
 		if val != "" {
 			parsed, err := strconv.ParseBool(val)
 			if err != nil {
-				return Credentials{}, fmt.Errorf("secret %s/%s invalid PROXMOX_SKIP_TLS_VERIFY: %w", ref.Namespace, ref.Name, err)
+				return Credentials{}, fmt.Errorf("secret %s/%s invalid PROXMOX_SKIP_TLS_VERIFY: %w", namespace, ref.Name, err)
 			}
 			insecure = parsed
 		}
@@ -267,7 +274,7 @@ func (p *Provider) getAvailableNode(ctx context.Context, spec provider.MachineSp
 			continue
 		}
 		// Skip offline nodes
-		if r.Status != "online" {
+		if r.Status != proxmoxStatusOnline {
 			fmt.Fprintf(os.Stderr, "skipping offline proxmox node %s (status: %s)\n", r.Node, r.Status)
 			continue
 		}
@@ -284,7 +291,7 @@ func (p *Provider) getAvailableNode(ctx context.Context, spec provider.MachineSp
 	// Randomize candidates.
 	rand.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
 
-	needMiB := int64(spec.MemoryMiB) + p.opts.VMMemOverheadMiB
+	needMiB := spec.MemoryMiB + p.opts.VMMemOverheadMiB
 	if needMiB <= 0 {
 		needMiB = 512 // safety default
 	}
@@ -442,7 +449,7 @@ func findNodeByVMName(vmName string, ctx context.Context, proxClient *proxmoxapi
 		if nodeStatus.Node == "" {
 			continue
 		}
-		if nodeStatus.Status != "online" {
+		if nodeStatus.Status != proxmoxStatusOnline {
 			continue
 		}
 		node, err := proxClient.Node(ctx, nodeName)
@@ -480,26 +487,22 @@ func (p *Provider) DeprovisionMachine(ctx context.Context, machine provider.Mach
 
 	stopVMTask, err := proxVM.Stop(ctx)
 	if err != nil {
-		err := fmt.Errorf("Error Stopping VM: %v\n", err)
-		return err
+		return fmt.Errorf("stop VM: %w", err)
 	}
 
 	fmt.Printf("Waiting for VM %s to stop...\n", proxVM.Name)
 	if err := stopVMTask.WaitFor(ctx, 600); err != nil {
-		err := fmt.Errorf("Error waiting for VM stop: %v\n", err)
-		return err
+		return fmt.Errorf("wait for VM stop: %w", err)
 	}
 
 	deleteVMTask, err := proxVM.Delete(ctx)
 	if err != nil {
-		err := fmt.Errorf("Error Deleting VM: %v\n", err)
-		return err
+		return fmt.Errorf("delete VM: %w", err)
 	}
 
 	fmt.Printf("Waiting for VM %s to be deleted...\n", proxVM.Name)
 	if err := deleteVMTask.WaitFor(ctx, 600); err != nil {
-		err := fmt.Errorf("Error waiting for VM deletion: %v\n", err)
-		return err
+		return fmt.Errorf("wait for VM deletion: %w", err)
 	}
 
 	return nil
@@ -515,7 +518,7 @@ func (p *Provider) ListMachines(ctx context.Context, namePrefix string) ([]provi
 	machines := []provider.Machine{}
 	for _, nodeStatus := range nodeStatuses {
 		// Skip offline nodes
-		if nodeStatus.Status != "online" {
+		if nodeStatus.Status != proxmoxStatusOnline {
 			continue
 		}
 		node, err := p.client.Node(ctx, nodeStatus.Name)
