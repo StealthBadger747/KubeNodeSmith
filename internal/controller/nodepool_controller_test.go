@@ -35,6 +35,18 @@ var _ = Describe("NodePool controller", func() {
 						Name:      resourceName,
 						Namespace: "default",
 					},
+					Spec: kubenodesmithv1alpha1.NodeSmithPoolSpec{
+						ProviderRef: "default-provider",
+						Limits: kubenodesmithv1alpha1.NodePoolLimits{
+							MinNodes:  1,
+							MaxNodes:  5,
+							CPUCores:  4,
+							MemoryMiB: 8192,
+						},
+						MachineTemplate: kubenodesmithv1alpha1.MachineTemplate{
+							KubeNodeNamePrefix: "default-node",
+						},
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}

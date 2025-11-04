@@ -25,13 +25,17 @@ func warnError(err error) {
 
 // Run executes the provided command within this context
 func Run(cmd *exec.Cmd) (string, error) {
-	dir, _ := GetProjectDir()
-	cmd.Dir = dir
-
-	if err := os.Chdir(cmd.Dir); err != nil {
-		_, _ = fmt.Fprintf(GinkgoWriter, "chdir dir: %q\n", err)
+	dir, err := GetProjectDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve project directory: %w", err)
 	}
 
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return "", fmt.Errorf("resolve project directory: resolved path was empty")
+	}
+
+	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "GO111MODULE=on")
 	command := strings.Join(cmd.Args, " ")
 	_, _ = fmt.Fprintf(GinkgoWriter, "running: %q\n", command)
