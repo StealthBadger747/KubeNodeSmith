@@ -3,9 +3,11 @@ package utils
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2" // nolint:revive,staticcheck
@@ -27,7 +29,10 @@ func warnError(err error) {
 func Run(cmd *exec.Cmd) (string, error) {
 	dir, err := GetProjectDir()
 	if err != nil {
-		return "", fmt.Errorf("resolve project directory: %w", err)
+		if dir == "" {
+			return "", fmt.Errorf("resolve project directory: %w", err)
+		}
+		warnError(fmt.Errorf("resolve project directory: %w", err))
 	}
 
 	dir = strings.TrimSpace(dir)
@@ -155,10 +160,33 @@ func GetNonEmptyLines(output string) []string {
 func GetProjectDir() (string, error) {
 	wd, err := os.Getwd()
 	if err != nil {
-		return wd, fmt.Errorf("failed to get current working directory: %w", err)
+		return "", fmt.Errorf("failed to get current working directory: %w", err)
 	}
-	wd = strings.ReplaceAll(wd, "/test/e2e", "")
-	return wd, nil
+	current := wd
+	for {
+		sentinel := filepath.Join(current, "go.mod")
+		if info, statErr := os.Stat(sentinel); statErr == nil {
+			if info.IsDir() {
+				return "", fmt.Errorf("project marker %q is a directory, expected file", sentinel)
+			}
+			return current, nil
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return "", fmt.Errorf("failed to stat %q: %w", sentinel, statErr)
+		}
+
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+		current = parent
+	}
+
+	fallback := strings.TrimSuffix(wd, "/test/e2e")
+	if fallback != wd {
+		return fallback, fmt.Errorf("unable to locate project root containing go.mod starting from %q; falling back to %q", wd, fallback)
+	}
+
+	return "", fmt.Errorf("unable to locate project root containing go.mod starting from %q", wd)
 }
 
 // UncommentCode searches for target in the file and remove the comment prefix

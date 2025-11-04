@@ -47,7 +47,7 @@ type NodeSmithControlPlane struct {
 
 	// metadata is a standard object metadata
 	// +optional
-	metav1.ObjectMeta `json:"metadata,omitempty,omitzero"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
 
 	// spec defines the desired state of NodeSmithControlPlane
 	// +required
@@ -55,7 +55,7 @@ type NodeSmithControlPlane struct {
 
 	// status defines the observed state of NodeSmithControlPlane
 	// +optional
-	Status NodeSmithControlPlaneStatus `json:"status,omitempty,omitzero"`
+	Status NodeSmithControlPlaneStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true

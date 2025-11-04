@@ -101,7 +101,7 @@ type NodeSmithClaim struct {
 
 	// metadata is a standard object metadata
 	// +optional
-	metav1.ObjectMeta `json:"metadata,omitempty,omitzero"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
 
 	// spec defines the desired state of NodeSmithClaim
 	// +required
@@ -109,7 +109,7 @@ type NodeSmithClaim struct {
 
 	// status defines the observed state of NodeSmithClaim
 	// +optional
-	Status NodeSmithClaimStatus `json:"status,omitempty,omitzero"`
+	Status NodeSmithClaimStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true
