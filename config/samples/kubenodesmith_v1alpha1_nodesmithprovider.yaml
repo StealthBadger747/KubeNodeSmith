@@ -1,9 +1,43 @@
 apiVersion: kubenodesmith.parawell.cloud/v1alpha1
 kind: NodeSmithProvider
 metadata:
-  labels:
-    app.kubernetes.io/name: kubenodesmith
-    app.kubernetes.io/managed-by: kustomize
-  name: nodesmithprovider-sample
+  name: proxmox-production
+  namespace: kubenodesmith
 spec:
-  # TODO(user): Add fields here
+  type: proxmox
+  credentialsSecretRef:
+    name: proxmox-api-secret
+    namespace: kubenodesmith
+  proxmox:
+    endpoint: https://10.0.4.30:8006/api2/json
+    nodeWhitelist:
+      - alfaromeo
+      - porsche
+    vmIDRange:
+      lower: 1250
+      upper: 1300
+    managedNodeTag: kubenodesmith-managed
+    vmMemOverheadMiB: 2048
+    networkInterfaces:
+      - name: net0
+        model: virtio
+        bridge: vmbr0
+        vlanTag: 20
+        macPrefix: "02:00:00"
+    vmOptions:
+      - name: sockets
+        value: 1
+      - name: cpu
+        value: host
+      - name: boot
+        value: order=net0
+      - name: ostype
+        value: l26
+      - name: ipconfig0
+        value: ip=dhcp
+      - name: ide2
+        value: local-zfs:cloudinit
+      - name: scsi0
+        value: local-zfs:16,serial=CONTAINERD01,discard=on,ssd=1
+      - name: cicustom
+        value: meta=snippets:snippets/zagato-shared-cloud-init-meta-data.yaml

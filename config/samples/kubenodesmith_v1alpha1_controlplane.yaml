@@ -1,9 +1,8 @@
 apiVersion: kubenodesmith.parawell.cloud/v1alpha1
 kind: NodeSmithControlPlane
 metadata:
-  labels:
-    app.kubernetes.io/name: kubenodesmith
-    app.kubernetes.io/managed-by: kustomize
-  name: nodesmithcontrolplane-sample
+  name: kubenodesmith
+  namespace: kubenodesmith
 spec:
-  # TODO(user): Add fields here
+  pools:
+    - proxmox-small

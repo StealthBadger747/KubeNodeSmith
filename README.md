@@ -105,8 +105,7 @@ Using Nix? Drop into the dev shell and run the controller manager locally:
 ```bash
 nix develop
 make install  # Install CRDs to your cluster
-kubectl apply -f manifests/app/nodesmith-resources.yaml  # adjust for your lab before applying
-make run
+make run      # Run controller manager locally
 ```
 
 The controller manager will:
@@ -115,9 +114,19 @@ The controller manager will:
 - Watch for changes to NodeSmith resources and unschedulable pods
 - Use leader election when running multiple replicas (disabled by default for local dev)
 
-Alternative flags for `go run ./cmd/main.go`:
-- `--metrics-bind-address=:8080` – Expose metrics endpoint
-- `--health-probe-bind-address=:8081` – Health/readiness probes
+**Configure your resources:**
+Edit `config/samples/` to match your infrastructure, then apply:
+```bash
+kubectl create namespace kubenodesmith
+kubectl create secret generic proxmox-api-secret \
+  --namespace kubenodesmith \
+  --from-literal=PROXMOX_TOKEN_ID='user@pam!tokenid' \
+  --from-literal=PROXMOX_SECRET='your-secret-here'
+kubectl apply -k config/samples/
+```
+
+Optional flags for `make run` or `go run ./cmd/main.go`:
+- `--health-probe-bind-address=:8081` – Health/readiness probes (default)
 - `--leader-elect` – Enable leader election for HA deployments
 
 ---
@@ -133,30 +142,27 @@ Alternative flags for `go run ./cmd/main.go`:
      --from-literal=PROXMOX_SECRET='your-secret-here'
    ```
 
-2. **Install CRDs using Kubebuilder:**
+2. **Install CRDs:**
    ```bash
    make install
-   # Or manually: kubectl apply -f config/crd/bases/
    ```
 
 3. **Configure resources for your environment:**
-   Edit `manifests/app/nodesmith-resources.yaml` to match your Proxmox setup, then apply:
+   Edit the sample files in `config/samples/` to match your infrastructure, then apply:
    ```bash
-   kubectl apply -f manifests/app/nodesmith-resources.yaml
+   kubectl apply -k config/samples/
    ```
 
 4. **Deploy the controller manager:**
    ```bash
-   make deploy IMG=<your-registry>/kubenodesmith:latest
-   # Or manually: kubectl apply -f manifests/app/kubenodesmith.yaml
+   make docker-build docker-push IMG=<your-registry>/kubenodesmith:tag
+   make deploy IMG=<your-registry>/kubenodesmith:tag
    ```
-
-   For GitOps: use `manifests/app/argocd-application.yaml`
 
 5. **Verify deployment:**
    ```bash
-   kubectl get pods -n kubenodesmith
-   kubectl logs -n kubenodesmith -l app=kubenodesmith -f
+   kubectl get pods -n kubenodesmith-system
+   kubectl logs -n kubenodesmith-system -l control-plane=controller-manager -f
    ```
 
    Health checks: `http://<pod>:8081/healthz` and `http://<pod>:8081/readyz`
@@ -165,7 +171,7 @@ Alternative flags for `go run ./cmd/main.go`:
 
 ## Configuration cheat sheet
 
-KubeNodeSmith uses CRDs under `kubenodesmith.parawell.cloud/v1alpha1`. See `manifests/app/nodesmith-resources.yaml` for a complete example:
+KubeNodeSmith uses CRDs under `kubenodesmith.parawell.cloud/v1alpha1`. See `config/samples/` for complete examples:
 
 ### NodeSmithProvider
 Defines infrastructure provider settings (Proxmox, Redfish, etc.):
@@ -192,7 +198,7 @@ spec:
     vmOptions:
       - { name: cpu, value: host }
       - { name: boot, value: order=net0 }
-      # ... see manifests/app/nodesmith-resources.yaml for full list
+      # ... see config/samples/kubenodesmith_v1alpha1_nodesmithprovider.yaml for full list
 ```
 
 ### NodeSmithPool
@@ -281,18 +287,24 @@ All Kubernetes interactions live in `internal/kube.go`; provider calls go throug
 
 ## Kicking the tires
 
-- Deploy one of the “heavy” sample workloads:
+- Deploy one of the sample workloads:
   ```bash
-  kubectl apply -f manifests/testcase-deployments/echoserver.yaml
+  kubectl apply -f config/samples/test-workloads/echoserver.yaml
   ```
 - Watch the scaler logs for a new node request and make sure the pod lands on it.
 - Delete the workload and confirm the node is eventually cordoned and removed.
 
 ---
 
-## Contributing & roadmap
+## Contributing
 
-I keep the future wish-list in `TODO.md`: better scheduling heuristics, more providers, observability, all the good stuff. If you open a PR, note how you tested it and what assumptions you made about your infrastructure.
+This project follows standard Kubebuilder patterns. When opening a PR:
+- Describe your testing approach
+- Note any infrastructure assumptions
+- Update CRD documentation if adding fields
+- Run `make test` and `make manifests` before committing
+
+See `config/` for generated manifests and RBAC rules.
 
 ---
 
