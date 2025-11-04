@@ -9,6 +9,7 @@ import (
 
 // NodeSmithClaimSpec defines the desired state of NodeSmithClaim
 type NodeSmithClaimSpec struct {
+	// +kubebuilder:validation:MinLength=1
 	PoolRef        string                      `json:"poolRef"`
 	Requirements   *NodeSmithClaimRequirements `json:"requirements,omitempty"`
 	IdempotencyKey string                      `json:"idempotencyKey,omitempty"`
