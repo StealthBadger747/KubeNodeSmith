@@ -91,7 +91,7 @@ func TestReconcileLaunchMarksClaimFailedWhenAttemptsExceeded(t *testing.T) {
 	if result == nil {
 		t.Fatalf("expected result, got nil")
 	}
-	if result.Requeue || result.RequeueAfter != 0 {
+	if result.RequeueAfter != 0 {
 		t.Fatalf("expected no requeue, got %#v", result)
 	}
 
@@ -188,7 +188,7 @@ func TestReconcileRegistrationRetriesAfterTimeout(t *testing.T) {
 	if result == nil {
 		t.Fatalf("expected result, got nil")
 	}
-	if !result.Requeue {
+	if result.RequeueAfter <= 0 {
 		t.Fatalf("expected requeue for retry, got %#v", result)
 	}
 
@@ -298,7 +298,7 @@ func TestReconcileRegistrationMarksFailedAfterMaxAttempts(t *testing.T) {
 	if result == nil {
 		t.Fatalf("expected result, got nil")
 	}
-	if result.Requeue || result.RequeueAfter != 0 {
+	if result.RequeueAfter != 0 {
 		t.Fatalf("expected no requeue after failure, got %#v", result)
 	}
 

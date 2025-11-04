@@ -177,7 +177,10 @@ func main() {
 
 	// Provider factories - shared by all controllers that need provider access
 	providerFactories := map[string]controller.ProviderBuilder{
-		"proxmox": func(ctx context.Context, providerObj *kubenodesmithv1alpha1.NodeSmithProvider) (provider.Provider, error) {
+		"proxmox": func(
+			ctx context.Context,
+			providerObj *kubenodesmithv1alpha1.NodeSmithProvider,
+		) (provider.Provider, error) {
 			return proxmox.NewProvider(ctx, providerObj)
 		},
 	}

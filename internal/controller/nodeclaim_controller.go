@@ -30,6 +30,7 @@ const (
 	maxLaunchAttempts = 3
 
 	// Requeue intervals for different phases
+	immediateRequeueDelay = time.Millisecond
 	requeueRegistration   = 30 * time.Second
 	requeueInitialization = 10 * time.Second
 	requeueOnError        = time.Minute
@@ -82,7 +83,7 @@ func (r *NodeClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			return ctrl.Result{}, err
 		}
 		// Return and requeue - ensure finalizer is persisted before continuing
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: immediateRequeueDelay}, nil
 	}
 
 	// Run lifecycle phases in order
@@ -394,7 +395,7 @@ func (r *NodeClaimReconciler) reconcileRegistration(ctx context.Context, claim *
 			r.Recorder.Eventf(claim, corev1.EventTypeWarning, "RegistrationTimeout",
 				"Node did not register within %v (attempt %d/%d); retrying", registrationTimeout, attempts, maxLaunchAttempts)
 
-			return &ctrl.Result{Requeue: true}, nil
+			return &ctrl.Result{RequeueAfter: immediateRequeueDelay}, nil
 		}
 
 		logger.V(1).Info("waiting for node to register", "elapsed", timeSinceLaunch, "timeout", registrationTimeout)

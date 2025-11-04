@@ -36,7 +36,7 @@ func countInflightClaims(pool *kubenodesmithv1alpha1.NodeSmithPool, claims *kube
 		if claim.Spec.PoolRef != pool.Name {
 			continue
 		}
-		if !claim.ObjectMeta.DeletionTimestamp.IsZero() {
+		if !claim.DeletionTimestamp.IsZero() {
 			logger.V(1).Info("skipping inflight claim marked for deletion", "claim", claim.Name)
 			continue
 		}

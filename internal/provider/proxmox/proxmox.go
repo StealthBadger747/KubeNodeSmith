@@ -48,19 +48,11 @@ type Provider struct {
 	opts   Options
 }
 
+const proxmoxStatusOnline = "online"
+
 // Endpoint returns the API endpoint configured for this provider.
 func (p *Provider) Endpoint() string {
 	return p.opts.Endpoint
-}
-
-func printNodes(nodeStatuses []*proxmoxapi.NodeStatus) {
-	for _, status := range nodeStatuses {
-		fmt.Printf("Node: %s, Status: %s,  Uptime: %d\n",
-			status.Node,
-			status.Status,
-			status.Uptime,
-		)
-	}
 }
 
 func generateNewVMID(clusterResources proxmoxapi.ClusterResources, opts Options) (int, error) {
@@ -131,17 +123,17 @@ func generateRandomMAC(prefix string) string {
 // NewProvider constructs a Proxmox-backed provider instance. It is expected to be called by the
 // autoscaler during startup. Secrets needed for authentication should already be resolved by the
 // caller and passed in via creds.
-func NewProvider(ctx context.Context, provider *kubenodesmithv1alpha1.NodeSmithProvider) (*Provider, error) {
-	if provider == nil {
+func NewProvider(ctx context.Context, providerResource *kubenodesmithv1alpha1.NodeSmithProvider) (*Provider, error) {
+	if providerResource == nil {
 		return nil, fmt.Errorf("provider resource is required")
 	}
 
-	parsedOpts, err := parseOptions(provider.Spec)
+	parsedOpts, err := parseOptions(providerResource.Spec)
 	if err != nil {
 		return nil, fmt.Errorf("parse proxmox options: %w", err)
 	}
 
-	creds, err := loadCredentials(ctx, provider.Namespace, provider.Spec.CredentialsSecretRef)
+	creds, err := loadCredentials(ctx, providerResource.Namespace, providerResource.Spec.CredentialsSecretRef)
 	if err != nil {
 		return nil, err
 	}
@@ -282,7 +274,7 @@ func (p *Provider) getAvailableNode(ctx context.Context, spec provider.MachineSp
 			continue
 		}
 		// Skip offline nodes
-		if r.Status != "online" {
+		if r.Status != proxmoxStatusOnline {
 			fmt.Fprintf(os.Stderr, "skipping offline proxmox node %s (status: %s)\n", r.Node, r.Status)
 			continue
 		}
@@ -299,7 +291,7 @@ func (p *Provider) getAvailableNode(ctx context.Context, spec provider.MachineSp
 	// Randomize candidates.
 	rand.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
 
-	needMiB := int64(spec.MemoryMiB) + p.opts.VMMemOverheadMiB
+	needMiB := spec.MemoryMiB + p.opts.VMMemOverheadMiB
 	if needMiB <= 0 {
 		needMiB = 512 // safety default
 	}
@@ -457,7 +449,7 @@ func findNodeByVMName(vmName string, ctx context.Context, proxClient *proxmoxapi
 		if nodeStatus.Node == "" {
 			continue
 		}
-		if nodeStatus.Status != "online" {
+		if nodeStatus.Status != proxmoxStatusOnline {
 			continue
 		}
 		node, err := proxClient.Node(ctx, nodeName)
@@ -495,26 +487,22 @@ func (p *Provider) DeprovisionMachine(ctx context.Context, machine provider.Mach
 
 	stopVMTask, err := proxVM.Stop(ctx)
 	if err != nil {
-		err := fmt.Errorf("Error Stopping VM: %v\n", err)
-		return err
+		return fmt.Errorf("stop VM: %w", err)
 	}
 
 	fmt.Printf("Waiting for VM %s to stop...\n", proxVM.Name)
 	if err := stopVMTask.WaitFor(ctx, 600); err != nil {
-		err := fmt.Errorf("Error waiting for VM stop: %v\n", err)
-		return err
+		return fmt.Errorf("wait for VM stop: %w", err)
 	}
 
 	deleteVMTask, err := proxVM.Delete(ctx)
 	if err != nil {
-		err := fmt.Errorf("Error Deleting VM: %v\n", err)
-		return err
+		return fmt.Errorf("delete VM: %w", err)
 	}
 
 	fmt.Printf("Waiting for VM %s to be deleted...\n", proxVM.Name)
 	if err := deleteVMTask.WaitFor(ctx, 600); err != nil {
-		err := fmt.Errorf("Error waiting for VM deletion: %v\n", err)
-		return err
+		return fmt.Errorf("wait for VM deletion: %w", err)
 	}
 
 	return nil
@@ -530,7 +518,7 @@ func (p *Provider) ListMachines(ctx context.Context, namePrefix string) ([]provi
 	machines := []provider.Machine{}
 	for _, nodeStatus := range nodeStatuses {
 		// Skip offline nodes
-		if nodeStatus.Status != "online" {
+		if nodeStatus.Status != proxmoxStatusOnline {
 			continue
 		}
 		node, err := p.client.Node(ctx, nodeStatus.Name)

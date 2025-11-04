@@ -79,7 +79,7 @@ func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	// Handle deletion - ensure all claims are cleaned up before removing pool
-	if !nodePool.ObjectMeta.DeletionTimestamp.IsZero() {
+	if !nodePool.DeletionTimestamp.IsZero() {
 		return r.finalizePool(ctx, &nodePool)
 	}
 
@@ -91,7 +91,7 @@ func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			logger.Error(err, "failed to add finalizer")
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 	}
 
 	pods, err := kube.GetUnschedulablePods(ctx, cs)

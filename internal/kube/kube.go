@@ -436,7 +436,7 @@ func getAllPodsOnNode(ctx context.Context, clientset *kubernetes.Clientset, node
 		return nil, err
 	}
 
-	var pods []corev1.Pod
+	pods := make([]corev1.Pod, 0, len(podList.Items))
 	for _, pod := range podList.Items {
 		// Skip mirror pods (static pods) - they don't consume resources
 		if _, ok := pod.Annotations["kubernetes.io/config.mirror"]; ok {
@@ -468,7 +468,7 @@ func GetScaleDownCandidates(ctx context.Context, clientset *kubernetes.Clientset
 		return nil, err
 	}
 
-	var candidates []corev1.Node
+	candidates := make([]corev1.Node, 0, len(nodes))
 
 	for _, node := range nodes {
 		// Only collect nodes that are auto-scaled
