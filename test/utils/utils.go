@@ -183,7 +183,11 @@ func GetProjectDir() (string, error) {
 
 	fallback := strings.TrimSuffix(wd, "/test/e2e")
 	if fallback != wd {
-		return fallback, fmt.Errorf("unable to locate project root containing go.mod starting from %q; falling back to %q", wd, fallback)
+		return fallback, fmt.Errorf(
+			"unable to locate project root containing go.mod starting from %q; falling back to %q",
+			wd,
+			fallback,
+		)
 	}
 
 	return "", fmt.Errorf("unable to locate project root containing go.mod starting from %q", wd)
