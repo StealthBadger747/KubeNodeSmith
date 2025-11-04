@@ -23,6 +23,8 @@ import (
 	kubenodesmithv1alpha1 "github.com/StealthBadger747/KubeNodeSmith/api/v1alpha1"
 )
 
+const kubeconfigFlag = "kubeconfig"
+
 var (
 	kubeconfigPath string
 	restOnce       sync.Once
@@ -35,17 +37,32 @@ func init() {
 	if home := homedir.HomeDir(); home != "" {
 		defaultPath = filepath.Join(home, ".kube", "config")
 	}
-	flag.StringVar(&kubeconfigPath, "kubeconfig", defaultPath, "(optional) absolute path to the kubeconfig file")
+	kubeconfigPath = defaultPath
+
+	if flag.Lookup(kubeconfigFlag) == nil {
+		flag.StringVar(&kubeconfigPath, kubeconfigFlag, defaultPath, "(optional) absolute path to the kubeconfig file")
+	}
 }
 
 func tryExplicitKubeconfig() (*rest.Config, error) {
-	if kubeconfigPath == "" {
+	path := getKubeconfigPath()
+	if path == "" {
 		return nil, fmt.Errorf("kubeconfig path not set")
 	}
-	if _, err := os.Stat(kubeconfigPath); err != nil {
+	if _, err := os.Stat(path); err != nil {
 		return nil, err
 	}
-	return clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+	return clientcmd.BuildConfigFromFlags("", path)
+}
+
+func getKubeconfigPath() string {
+	if f := flag.Lookup(kubeconfigFlag); f != nil {
+		value := strings.TrimSpace(f.Value.String())
+		if value != "" {
+			return value
+		}
+	}
+	return kubeconfigPath
 }
 
 func loadRESTConfig() {
