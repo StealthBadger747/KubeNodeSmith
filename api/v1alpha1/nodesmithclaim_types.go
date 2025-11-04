@@ -19,8 +19,8 @@ type NodeSmithClaimSpec struct {
 }
 
 // NodeSmithClaimRequirements specifies the resource requirements for a claim.
-// +kubebuilder:validation:XValidation:rule="self.cpuCores > 0",message="cpuCores must be positive"
-// +kubebuilder:validation:XValidation:rule="self.memoryMiB > 0",message="memoryMiB must be positive"
+// +kubebuilder:validation:XValidation:rule="!has(self.cpuCores) || self.cpuCores > 0",message="cpuCores must be positive"
+// +kubebuilder:validation:XValidation:rule="!has(self.memoryMiB) || self.memoryMiB > 0",message="memoryMiB must be positive"
 type NodeSmithClaimRequirements struct {
 	CPUCores  int64 `json:"cpuCores,omitempty"`
 	MemoryMiB int64 `json:"memoryMiB,omitempty"`

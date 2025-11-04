@@ -56,9 +56,9 @@ spec:
                 type: object
                 x-kubernetes-validations:
                 - message: cpuCores must be positive
-                  rule: self.cpuCores > 0
+                  rule: '!has(self.cpuCores) || self.cpuCores > 0'
                 - message: memoryMiB must be positive
-                  rule: self.memoryMiB > 0
+                  rule: '!has(self.memoryMiB) || self.memoryMiB > 0'
               terminationGracePeriod:
                 description: |-
                   TerminationGracePeriod bounds how long NodeSmith waits for pods to gracefully exit
