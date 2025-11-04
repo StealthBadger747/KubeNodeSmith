@@ -175,14 +175,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := (&controller.ControlPlaneReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		ProviderFactories: map[string]controller.ProviderBuilder{
-			"proxmox": func(ctx context.Context, providerObj *kubenodesmithv1alpha1.NodeSmithProvider) (provider.Provider, error) {
-				return proxmox.NewProvider(ctx, providerObj)
-			},
+	// Provider factories - shared by all controllers that need provider access
+	providerFactories := map[string]controller.ProviderBuilder{
+		"proxmox": func(ctx context.Context, providerObj *kubenodesmithv1alpha1.NodeSmithProvider) (provider.Provider, error) {
+			return proxmox.NewProvider(ctx, providerObj)
 		},
+	}
+
+	if err := (&controller.ControlPlaneReconciler{
+		Client:            mgr.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		ProviderFactories: providerFactories,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ControlPlane")
 		os.Exit(1)
@@ -196,9 +199,10 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.NodeClaimReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("nodeclaim-controller"),
+		Client:            mgr.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		Recorder:          mgr.GetEventRecorderFor("nodeclaim-controller"),
+		ProviderFactories: providerFactories,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "NodeClaim")
 		os.Exit(1)

@@ -23,9 +23,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
-// ProviderBuilder constructs a concrete provider implementation from a NodeSmithProvider spec.
-type ProviderBuilder func(ctx context.Context, provider *kubenodesmithv1alpha1.NodeSmithProvider) (provider.Provider, error)
-
 type providerCacheEntry struct {
 	provider        provider.Provider
 	resourceVersion string

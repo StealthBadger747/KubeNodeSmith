@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -18,6 +19,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	kubenodesmithv1alpha1 "github.com/StealthBadger747/KubeNodeSmith/api/v1alpha1"
+	"github.com/StealthBadger747/KubeNodeSmith/internal/provider"
 )
 
 const (
@@ -34,8 +36,9 @@ const (
 // NodeClaimReconciler reconciles a NodeSmithClaim object.
 type NodeClaimReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	Scheme            *runtime.Scheme
+	Recorder          record.EventRecorder
+	ProviderFactories map[string]ProviderBuilder
 }
 
 // +kubebuilder:rbac:groups=kubenodesmith.parawell.cloud,resources=nodesmithclaims,verbs=get;list;watch;create;update;patch;delete
@@ -122,25 +125,60 @@ func (r *NodeClaimReconciler) reconcileLaunch(ctx context.Context, claim *kubeno
 		"idempotencyKey", claim.Spec.IdempotencyKey,
 	)
 
-	// TODO: Get provider from pool and call ProvisionMachine
-	// For now, we'll stub this out with a placeholder
-	// In a real implementation:
-	// 1. Get the pool referenced by claim.Spec.PoolRef
-	// 2. Get the provider from the pool
-	// 3. Call provider.ProvisionMachine(ctx, spec)
-	// 4. Store the returned providerID immediately
+	// Get the provider for this claim
+	prov, err := r.getProviderForClaim(ctx, claim)
+	if err != nil {
+		logger.Error(err, "failed to get provider for claim")
+		meta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
+			Type:               kubenodesmithv1alpha1.ConditionTypeLaunched,
+			Status:             metav1.ConditionFalse,
+			Reason:             "ProviderError",
+			Message:            fmt.Sprintf("Failed to get provider: %v", err),
+			ObservedGeneration: claim.Generation,
+		})
+		if updateErr := r.Status().Update(ctx, claim); updateErr != nil {
+			logger.Error(updateErr, "failed to update status after provider error")
+		}
+		return &ctrl.Result{RequeueAfter: requeueOnError}, err
+	}
 
-	// Placeholder: simulate machine provisioning
-	// providerID := fmt.Sprintf("proxmox://cluster-1/vms/%s", claim.Spec.IdempotencyKey[:8])
+	// Build the machine spec
+	spec := provider.MachineSpec{
+		NamePrefix: fmt.Sprintf("%s-%s", claim.Spec.PoolRef, claim.Name),
+		CPUCores:   claim.Spec.Requirements.CPUCores,
+		MemoryMiB:  claim.Spec.Requirements.MemoryMiB,
+	}
 
-	// TODO: Uncomment when provider integration is ready
-	// claim.Status.ProviderID = providerID
+	// Provision the machine
+	machine, err := prov.ProvisionMachine(ctx, spec)
+	if err != nil {
+		logger.Error(err, "failed to provision machine")
+		meta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
+			Type:               kubenodesmithv1alpha1.ConditionTypeLaunched,
+			Status:             metav1.ConditionFalse,
+			Reason:             "ProvisioningFailed",
+			Message:            fmt.Sprintf("Failed to provision machine: %v", err),
+			ObservedGeneration: claim.Generation,
+		})
+		if updateErr := r.Status().Update(ctx, claim); updateErr != nil {
+			logger.Error(updateErr, "failed to update status after provisioning error")
+		}
+		return &ctrl.Result{RequeueAfter: requeueOnError}, err
+	}
+
+	logger.Info("machine provisioned successfully",
+		"providerID", machine.ProviderID,
+		"kubeNodeName", machine.KubeNodeName,
+	)
+
+	// CRITICAL: Store the providerID immediately
+	claim.Status.ProviderID = machine.ProviderID
 
 	meta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
 		Type:               kubenodesmithv1alpha1.ConditionTypeLaunched,
 		Status:             metav1.ConditionTrue,
 		Reason:             "Launched",
-		Message:            "Machine provisioned successfully",
+		Message:            fmt.Sprintf("Machine provisioned: %s", machine.ProviderID),
 		ObservedGeneration: claim.Generation,
 	})
 
@@ -221,11 +259,26 @@ func (r *NodeClaimReconciler) reconcileRegistration(ctx context.Context, claim *
 	if launchedCond != nil {
 		timeSinceLaunch := time.Since(launchedCond.LastTransitionTime.Time)
 		if timeSinceLaunch > registrationTimeout {
-			// Timeout! Fail the claim
+			// Timeout! Fail the claim and deprovision the machine
 			logger.Info("registration timeout exceeded", "elapsed", timeSinceLaunch)
 
-			// TODO: Deprovision the machine
-			// provider.DeprovisionMachine(ctx, claim.Status.ProviderID)
+			// Deprovision the machine
+			prov, err := r.getProviderForClaim(ctx, claim)
+			if err != nil {
+				logger.Error(err, "failed to get provider for deprovisioning after timeout")
+			} else {
+				machine := provider.Machine{
+					ProviderID: claim.Status.ProviderID,
+				}
+				if err := prov.DeprovisionMachine(ctx, machine); err != nil {
+					logger.Error(err, "failed to deprovision machine after timeout")
+					// Continue anyway - we mark this as failed regardless
+				} else {
+					logger.Info("machine deprovisioned after registration timeout")
+					r.Recorder.Eventf(claim, corev1.EventTypeWarning, "MachineDeprovisioned",
+						"Machine deprovisioned due to registration timeout")
+				}
+			}
 
 			meta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
 				Type:               kubenodesmithv1alpha1.ConditionTypeRegistered,
@@ -383,11 +436,46 @@ func (r *NodeClaimReconciler) finalize(ctx context.Context, claim *kubenodesmith
 	if claim.Status.ProviderID != "" {
 		logger.Info("deprovisioning machine", "providerID", claim.Status.ProviderID)
 
-		// TODO: Get provider and call DeprovisionMachine
-		// provider.DeprovisionMachine(ctx, claim.Status.ProviderID)
+		prov, err := r.getProviderForClaim(ctx, claim)
+		if err != nil {
+			// Failed to get provider - this could mean the pool or provider was deleted
+			// Log the error and emit a warning event for visibility
+			logger.Error(err, "failed to get provider for deprovisioning",
+				"providerID", claim.Status.ProviderID,
+				"pool", claim.Spec.PoolRef,
+			)
 
-		r.Recorder.Eventf(claim, corev1.EventTypeNormal, "MachineDeprovisioned",
-			"Machine deprovisioned")
+			r.Recorder.Eventf(claim, corev1.EventTypeWarning, "DeprovisioningFailed",
+				"Cannot deprovision machine %s: provider unavailable. Manual cleanup may be required for pool %s",
+				claim.Status.ProviderID, claim.Spec.PoolRef)
+
+			// Check if this is a NotFound error - if so, resources were deleted
+			if apierrors.IsNotFound(err) {
+				logger.Info("pool or provider was deleted - cannot deprovision machine, manual cleanup required",
+					"providerID", claim.Status.ProviderID,
+					"pool", claim.Spec.PoolRef,
+				)
+			}
+			// Continue with finalizer removal - don't block cleanup indefinitely
+			// but the warning event provides visibility for manual intervention
+		} else {
+			machine := provider.Machine{
+				ProviderID: claim.Status.ProviderID,
+			}
+			if err := prov.DeprovisionMachine(ctx, machine); err != nil {
+				logger.Error(err, "failed to deprovision machine",
+					"providerID", claim.Status.ProviderID,
+				)
+				r.Recorder.Eventf(claim, corev1.EventTypeWarning, "DeprovisioningFailed",
+					"Failed to deprovision machine %s: %v. Manual cleanup may be required",
+					claim.Status.ProviderID, err)
+				// Continue with finalizer removal - don't block cleanup
+			} else {
+				logger.Info("machine deprovisioned successfully")
+				r.Recorder.Eventf(claim, corev1.EventTypeNormal, "MachineDeprovisioned",
+					"Machine %s deprovisioned", claim.Status.ProviderID)
+			}
+		}
 	}
 
 	// Step 3: Remove finalizer (allows garbage collection)
@@ -413,6 +501,58 @@ func nodeMatchesClaim(node *corev1.Node, claim *kubenodesmithv1alpha1.NodeSmithC
 		}
 	}
 	return false
+}
+
+// getProviderForClaim retrieves the provider instance for a claim by looking up its pool and provider.
+func (r *NodeClaimReconciler) getProviderForClaim(ctx context.Context, claim *kubenodesmithv1alpha1.NodeSmithClaim) (provider.Provider, error) {
+	logger := logf.FromContext(ctx)
+
+	// Get the pool
+	var pool kubenodesmithv1alpha1.NodeSmithPool
+	poolKey := types.NamespacedName{Namespace: claim.Namespace, Name: claim.Spec.PoolRef}
+	if err := r.Get(ctx, poolKey, &pool); err != nil {
+		return nil, fmt.Errorf("get pool %s: %w", poolKey, err)
+	}
+
+	if pool.Spec.ProviderRef == "" {
+		return nil, fmt.Errorf("pool %s has empty providerRef", pool.Name)
+	}
+
+	// Get the provider
+	var providerObj kubenodesmithv1alpha1.NodeSmithProvider
+	providerKey := types.NamespacedName{Namespace: claim.Namespace, Name: pool.Spec.ProviderRef}
+	if err := r.Get(ctx, providerKey, &providerObj); err != nil {
+		return nil, fmt.Errorf("get provider %s: %w", providerKey, err)
+	}
+
+	providerType := strings.ToLower(strings.TrimSpace(providerObj.Spec.Type))
+	if providerType == "" {
+		return nil, fmt.Errorf("provider %s has empty type", providerObj.Name)
+	}
+
+	// Get the provider factory
+	if len(r.ProviderFactories) == 0 {
+		return nil, fmt.Errorf("no provider factories configured")
+	}
+
+	builder, ok := r.ProviderFactories[providerType]
+	if !ok {
+		return nil, fmt.Errorf("unsupported provider type %q", providerType)
+	}
+
+	// Build the provider instance
+	providerInstance, err := builder(ctx, &providerObj)
+	if err != nil {
+		return nil, fmt.Errorf("initialize provider %s: %w", providerObj.Name, err)
+	}
+
+	logger.V(1).Info("resolved provider for claim",
+		"pool", pool.Name,
+		"provider", providerObj.Name,
+		"providerType", providerType,
+	)
+
+	return providerInstance, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
