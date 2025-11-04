@@ -26,6 +26,9 @@ const (
 	// Registration timeout - if node doesn't register within this time, deprovision and fail
 	registrationTimeout = 15 * time.Minute
 
+	// Maximum number of times we'll attempt to launch/register a machine before marking the claim failed
+	maxLaunchAttempts = 3
+
 	// Requeue intervals for different phases
 	requeueRegistration   = 30 * time.Second
 	requeueInitialization = 10 * time.Second
@@ -84,6 +87,11 @@ func (r *NodeClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	// Run lifecycle phases in order
 	// Each phase returns (result, error) - if non-nil, we stop and return
+	if failedCond := meta.FindStatusCondition(claim.Status.Conditions, kubenodesmithv1alpha1.ConditionTypeFailed); failedCond != nil && failedCond.Status == metav1.ConditionTrue {
+		logger.Info("claim is in failed state, skipping reconciliation", "reason", failedCond.Reason)
+		return ctrl.Result{}, nil
+	}
+
 	if result, err := r.reconcileLaunch(ctx, &claim); result != nil || err != nil {
 		return *result, err
 	}
@@ -101,7 +109,6 @@ func (r *NodeClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 }
 
 // reconcileLaunch handles the machine provisioning phase.
-// This is CRITICAL for durability - we must store providerID immediately after provisioning.
 func (r *NodeClaimReconciler) reconcileLaunch(ctx context.Context, claim *kubenodesmithv1alpha1.NodeSmithClaim) (*ctrl.Result, error) {
 	logger := logf.FromContext(ctx).WithValues("claim", claim.Name)
 
@@ -109,6 +116,39 @@ func (r *NodeClaimReconciler) reconcileLaunch(ctx context.Context, claim *kubeno
 	if claim.Status.ProviderID != "" {
 		// Machine already provisioned, move to next phase
 		return nil, nil
+	}
+
+	if claim.Status.LaunchAttempts >= maxLaunchAttempts {
+		launchCond := meta.FindStatusCondition(claim.Status.Conditions, kubenodesmithv1alpha1.ConditionTypeLaunched)
+		message := fmt.Sprintf("Exceeded maximum launch attempts (%d)", maxLaunchAttempts)
+		if launchCond != nil && strings.TrimSpace(launchCond.Message) != "" {
+			message = fmt.Sprintf("%s; last launch error: %s", message, launchCond.Message)
+		}
+
+		setCondition := func(condType string, isTrue bool) {
+			status := metav1.ConditionFalse
+			if isTrue {
+				status = metav1.ConditionTrue
+			}
+			meta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
+				Type:               condType,
+				Status:             status,
+				Reason:             "LaunchAttemptsExceeded",
+				Message:            message,
+				ObservedGeneration: claim.Generation,
+			})
+		}
+
+		setCondition(kubenodesmithv1alpha1.ConditionTypeFailed, true)
+		setCondition(kubenodesmithv1alpha1.ConditionTypeLaunched, false)
+
+		if err := r.Status().Update(ctx, claim); err != nil {
+			logger.Error(err, "failed to update status after exceeding launch attempts")
+			return &ctrl.Result{}, err
+		}
+
+		logger.Info("maximum launch attempts reached, marking claim failed")
+		return &ctrl.Result{}, nil
 	}
 
 	// Check if Launched condition already True (but providerID missing - recovery case)
@@ -119,10 +159,14 @@ func (r *NodeClaimReconciler) reconcileLaunch(ctx context.Context, claim *kubeno
 		// TODO: Attempt to find machine by idempotency key from provider
 	}
 
+	nextAttempt := claim.Status.LaunchAttempts + 1
+
 	logger.Info("launching machine for claim",
 		"cpuCores", claim.Spec.Requirements.CPUCores,
 		"memoryMiB", claim.Spec.Requirements.MemoryMiB,
 		"idempotencyKey", claim.Spec.IdempotencyKey,
+		"attempt", nextAttempt,
+		"maxAttempts", maxLaunchAttempts,
 	)
 
 	// Get the provider for this claim
@@ -148,6 +192,9 @@ func (r *NodeClaimReconciler) reconcileLaunch(ctx context.Context, claim *kubeno
 		CPUCores:   claim.Spec.Requirements.CPUCores,
 		MemoryMiB:  claim.Spec.Requirements.MemoryMiB,
 	}
+
+	// Persist the attempt number so registration timeouts know how many retries remain
+	claim.Status.LaunchAttempts = nextAttempt
 
 	// Provision the machine
 	machine, err := prov.ProvisionMachine(ctx, spec)
@@ -232,6 +279,8 @@ func (r *NodeClaimReconciler) reconcileRegistration(ctx context.Context, claim *
 			// Found it!
 			logger.Info("node registered", "nodeName", node.Name)
 			claim.Status.NodeName = node.Name
+			claim.Status.LaunchAttempts = 0
+			meta.RemoveStatusCondition(&claim.Status.Conditions, kubenodesmithv1alpha1.ConditionTypeFailed)
 
 			// Apply labels from pool to node if needed
 			// TODO: Get pool and apply template labels
@@ -280,23 +329,72 @@ func (r *NodeClaimReconciler) reconcileRegistration(ctx context.Context, claim *
 				}
 			}
 
+			claim.Status.ProviderID = ""
+			attempts := claim.Status.LaunchAttempts
+			if attempts == 0 {
+				attempts = 1
+			}
+
+			maxAttemptsReached := attempts >= maxLaunchAttempts
+			var registeredMessage string
+			if maxAttemptsReached {
+				registeredMessage = fmt.Sprintf("Node did not register within %v after %d attempts; giving up", registrationTimeout, attempts)
+			} else {
+				registeredMessage = fmt.Sprintf("Node did not register within %v (attempt %d/%d); retrying", registrationTimeout, attempts, maxLaunchAttempts)
+			}
+
 			meta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
 				Type:               kubenodesmithv1alpha1.ConditionTypeRegistered,
 				Status:             metav1.ConditionFalse,
 				Reason:             "Timeout",
-				Message:            fmt.Sprintf("Node did not register within %v", registrationTimeout),
+				Message:            registeredMessage,
+				ObservedGeneration: claim.Generation,
+			})
+
+			if maxAttemptsReached {
+				meta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
+					Type:               kubenodesmithv1alpha1.ConditionTypeLaunched,
+					Status:             metav1.ConditionFalse,
+					Reason:             "RegistrationTimeoutExceeded",
+					Message:            registeredMessage,
+					ObservedGeneration: claim.Generation,
+				})
+				meta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
+					Type:               kubenodesmithv1alpha1.ConditionTypeFailed,
+					Status:             metav1.ConditionTrue,
+					Reason:             "RegistrationTimeoutExceeded",
+					Message:            registeredMessage,
+					ObservedGeneration: claim.Generation,
+				})
+
+				if err := r.Status().Update(ctx, claim); err != nil {
+					logger.Error(err, "failed to update status after exhausting registration retries")
+					return &ctrl.Result{}, err
+				}
+
+				r.Recorder.Eventf(claim, corev1.EventTypeWarning, "RegistrationFailed",
+					"Node did not register within %v after %d attempts; giving up", registrationTimeout, attempts)
+
+				return &ctrl.Result{}, nil
+			}
+
+			meta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
+				Type:               kubenodesmithv1alpha1.ConditionTypeLaunched,
+				Status:             metav1.ConditionFalse,
+				Reason:             "RegistrationTimeout",
+				Message:            fmt.Sprintf("Cleared provider ID to retry launch (%d/%d)", attempts+1, maxLaunchAttempts),
 				ObservedGeneration: claim.Generation,
 			})
 
 			if err := r.Status().Update(ctx, claim); err != nil {
 				logger.Error(err, "failed to update status after timeout")
+				return &ctrl.Result{}, err
 			}
 
 			r.Recorder.Eventf(claim, corev1.EventTypeWarning, "RegistrationTimeout",
-				"Node did not register within %v", registrationTimeout)
+				"Node did not register within %v (attempt %d/%d); retrying", registrationTimeout, attempts, maxLaunchAttempts)
 
-			// Don't requeue - this is a terminal failure
-			return &ctrl.Result{}, fmt.Errorf("registration timeout")
+			return &ctrl.Result{Requeue: true}, nil
 		}
 
 		logger.V(1).Info("waiting for node to register", "elapsed", timeSinceLaunch, "timeout", registrationTimeout)

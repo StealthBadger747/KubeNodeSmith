@@ -140,6 +140,12 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              launchAttempts:
+                description: |-
+                  launchAttempts tracks how many times we've attempted to launch and register
+                  a machine for this claim. After exceeding the max retry count, the claim
+                  is marked as Failed and reconciliation stops.
+                type: integer
               nodeName:
                 description: |-
                   nodeName is the name of the Kubernetes Node object that corresponds to this claim.

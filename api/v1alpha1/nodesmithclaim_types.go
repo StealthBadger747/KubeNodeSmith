@@ -42,6 +42,10 @@ const (
 	// ConditionTypeReady is the overall readiness condition, typically dependent on
 	// Launched, Registered, and Initialized all being True.
 	ConditionTypeReady = "Ready"
+
+	// ConditionTypeFailed indicates an unrecoverable error occurred.
+	// When this condition is True, the controller will stop reconciling the claim.
+	ConditionTypeFailed = "Failed"
 )
 
 // Finalizer for NodeSmithClaim to ensure proper cleanup of cloud resources.
@@ -80,6 +84,12 @@ type NodeSmithClaimStatus struct {
 	// This field is informational and helps track which provider configuration was used.
 	// +optional
 	ProviderRef string `json:"providerRef,omitempty"`
+
+	// launchAttempts tracks how many times we've attempted to launch and register
+	// a machine for this claim. After exceeding the max retry count, the claim
+	// is marked as Failed and reconciliation stops.
+	// +optional
+	LaunchAttempts int `json:"launchAttempts,omitempty"`
 }
 
 // +kubebuilder:object:root=true
