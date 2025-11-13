@@ -6,9 +6,8 @@ import "context"
 // when bringing a new worker online. Providers can interpret additional fields
 // via Tags.
 type MachineSpec struct {
-	// NamePrefix becomes part of the eventual Kubernetes node name so the
-	// autoscaler can correlate machines it created.
-	NamePrefix string
+	// MachineName is the controller-assigned identifier for the machine.
+	MachineName string
 	// CPUCores represents whole virtual cores requested for the machine.
 	CPUCores int64
 	// MemoryMiB is the desired memory size in mebibytes available to the node.

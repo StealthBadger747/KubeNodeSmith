@@ -193,9 +193,9 @@ func (r *NodeClaimReconciler) reconcileLaunch(ctx context.Context, claim *kubeno
 
 	// Build the machine machineSpec
 	machineSpec := provider.MachineSpec{
-		NamePrefix: claim.Name,
-		CPUCores:   claim.Spec.Requirements.CPUCores,
-		MemoryMiB:  claim.Spec.Requirements.MemoryMiB,
+		MachineName: claim.Name,
+		CPUCores:    claim.Spec.Requirements.CPUCores,
+		MemoryMiB:   claim.Spec.Requirements.MemoryMiB,
 	}
 
 	// Persist the attempt number so registration timeouts know how many retries remain

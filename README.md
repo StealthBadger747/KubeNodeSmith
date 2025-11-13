@@ -218,7 +218,6 @@ spec:
     cpuCores: 0        # 0 = unlimited
     memoryMiB: 30720   # aggregate memory ceiling
   machineTemplate:
-    kubeNodeNamePrefix: zagato-worker-auto
     labels:
       node-role.kubernetes.io/worker: ""
   scaleUp:

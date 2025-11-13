@@ -11,7 +11,6 @@ spec:
     cpuCores: 0
     memoryMiB: 30720
   machineTemplate:
-    kubeNodeNamePrefix: zagato-worker-auto
     labels:
       node-role.kubernetes.io/worker: ""
   scaleUp:
