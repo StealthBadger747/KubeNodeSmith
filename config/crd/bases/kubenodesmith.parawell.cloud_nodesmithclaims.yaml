@@ -42,6 +42,7 @@ spec:
               idempotencyKey:
                 type: string
               poolRef:
+                minLength: 1
                 type: string
               requirements:
                 description: NodeSmithClaimRequirements specifies the resource requirements
