@@ -7,12 +7,14 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -127,24 +129,24 @@ func (r *NodeClaimReconciler) reconcileLaunch(ctx context.Context, claim *kubeno
 			message = fmt.Sprintf("%s; last launch error: %s", message, launchCond.Message)
 		}
 
-		setCondition := func(condType string, isTrue bool) {
-			status := metav1.ConditionFalse
-			if isTrue {
-				status = metav1.ConditionTrue
+		if err := r.updateStatus(ctx, claim, func(updated *kubenodesmithv1alpha1.NodeSmithClaim) {
+			setCondition := func(condType string, isTrue bool) {
+				status := metav1.ConditionFalse
+				if isTrue {
+					status = metav1.ConditionTrue
+				}
+				meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
+					Type:               condType,
+					Status:             status,
+					Reason:             "LaunchAttemptsExceeded",
+					Message:            message,
+					ObservedGeneration: updated.Generation,
+				})
 			}
-			meta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
-				Type:               condType,
-				Status:             status,
-				Reason:             "LaunchAttemptsExceeded",
-				Message:            message,
-				ObservedGeneration: claim.Generation,
-			})
-		}
 
-		setCondition(kubenodesmithv1alpha1.ConditionTypeFailed, true)
-		setCondition(kubenodesmithv1alpha1.ConditionTypeLaunched, false)
-
-		if err := r.Status().Update(ctx, claim); err != nil {
+			setCondition(kubenodesmithv1alpha1.ConditionTypeFailed, true)
+			setCondition(kubenodesmithv1alpha1.ConditionTypeLaunched, false)
+		}); err != nil {
 			logger.Error(err, "failed to update status after exceeding launch attempts")
 			return &ctrl.Result{}, err
 		}
@@ -175,14 +177,15 @@ func (r *NodeClaimReconciler) reconcileLaunch(ctx context.Context, claim *kubeno
 	prov, err := r.getProviderForClaim(ctx, claim)
 	if err != nil {
 		logger.Error(err, "failed to get provider for claim")
-		meta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
-			Type:               kubenodesmithv1alpha1.ConditionTypeLaunched,
-			Status:             metav1.ConditionFalse,
-			Reason:             "ProviderError",
-			Message:            fmt.Sprintf("Failed to get provider: %v", err),
-			ObservedGeneration: claim.Generation,
-		})
-		if updateErr := r.Status().Update(ctx, claim); updateErr != nil {
+		if updateErr := r.updateStatus(ctx, claim, func(updated *kubenodesmithv1alpha1.NodeSmithClaim) {
+			meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
+				Type:               kubenodesmithv1alpha1.ConditionTypeLaunched,
+				Status:             metav1.ConditionFalse,
+				Reason:             "ProviderError",
+				Message:            fmt.Sprintf("Failed to get provider: %v", err),
+				ObservedGeneration: updated.Generation,
+			})
+		}); updateErr != nil {
 			logger.Error(updateErr, "failed to update status after provider error")
 		}
 		return &ctrl.Result{RequeueAfter: requeueOnError}, err
@@ -202,14 +205,16 @@ func (r *NodeClaimReconciler) reconcileLaunch(ctx context.Context, claim *kubeno
 	machine, err := prov.ProvisionMachine(ctx, machineSpec)
 	if err != nil {
 		logger.Error(err, "failed to provision machine")
-		meta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
-			Type:               kubenodesmithv1alpha1.ConditionTypeLaunched,
-			Status:             metav1.ConditionFalse,
-			Reason:             "ProvisioningFailed",
-			Message:            fmt.Sprintf("Failed to provision machine: %v", err),
-			ObservedGeneration: claim.Generation,
-		})
-		if updateErr := r.Status().Update(ctx, claim); updateErr != nil {
+		if updateErr := r.updateStatus(ctx, claim, func(updated *kubenodesmithv1alpha1.NodeSmithClaim) {
+			updated.Status.LaunchAttempts = nextAttempt
+			meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
+				Type:               kubenodesmithv1alpha1.ConditionTypeLaunched,
+				Status:             metav1.ConditionFalse,
+				Reason:             "ProvisioningFailed",
+				Message:            fmt.Sprintf("Failed to provision machine: %v", err),
+				ObservedGeneration: updated.Generation,
+			})
+		}); updateErr != nil {
 			logger.Error(updateErr, "failed to update status after provisioning error")
 		}
 		return &ctrl.Result{RequeueAfter: requeueOnError}, err
@@ -223,15 +228,17 @@ func (r *NodeClaimReconciler) reconcileLaunch(ctx context.Context, claim *kubeno
 	// CRITICAL: Store the providerID immediately
 	claim.Status.ProviderID = machine.ProviderID
 
-	meta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
-		Type:               kubenodesmithv1alpha1.ConditionTypeLaunched,
-		Status:             metav1.ConditionTrue,
-		Reason:             "Launched",
-		Message:            fmt.Sprintf("Machine provisioned: %s", machine.ProviderID),
-		ObservedGeneration: claim.Generation,
-	})
-
-	if err := r.Status().Update(ctx, claim); err != nil {
+	if err := r.updateStatus(ctx, claim, func(updated *kubenodesmithv1alpha1.NodeSmithClaim) {
+		updated.Status.ProviderID = machine.ProviderID
+		updated.Status.LaunchAttempts = nextAttempt
+		meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
+			Type:               kubenodesmithv1alpha1.ConditionTypeLaunched,
+			Status:             metav1.ConditionTrue,
+			Reason:             "Launched",
+			Message:            fmt.Sprintf("Machine provisioned: %s", machine.ProviderID),
+			ObservedGeneration: updated.Generation,
+		})
+	}); err != nil {
 		logger.Error(err, "failed to update status after launch")
 		// CRITICAL: If this fails, next reconcile will retry provisioning
 		// Provider MUST be idempotent (return existing machine for same idempotency key)
@@ -287,15 +294,18 @@ func (r *NodeClaimReconciler) reconcileRegistration(ctx context.Context, claim *
 			// Apply labels from pool to node if needed
 			// TODO: Get pool and apply template labels
 
-			meta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
-				Type:               kubenodesmithv1alpha1.ConditionTypeRegistered,
-				Status:             metav1.ConditionTrue,
-				Reason:             "Registered",
-				Message:            fmt.Sprintf("Node %s joined cluster", node.Name),
-				ObservedGeneration: claim.Generation,
-			})
-
-			if err := r.Status().Update(ctx, claim); err != nil {
+			if err := r.updateStatus(ctx, claim, func(updated *kubenodesmithv1alpha1.NodeSmithClaim) {
+				updated.Status.NodeName = node.Name
+				updated.Status.LaunchAttempts = 0
+				meta.RemoveStatusCondition(&updated.Status.Conditions, kubenodesmithv1alpha1.ConditionTypeFailed)
+				meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
+					Type:               kubenodesmithv1alpha1.ConditionTypeRegistered,
+					Status:             metav1.ConditionTrue,
+					Reason:             "Registered",
+					Message:            fmt.Sprintf("Node %s joined cluster", node.Name),
+					ObservedGeneration: updated.Generation,
+				})
+			}); err != nil {
 				logger.Error(err, "failed to update status after registration")
 				return &ctrl.Result{}, err
 			}
@@ -345,52 +355,50 @@ func (r *NodeClaimReconciler) reconcileRegistration(ctx context.Context, claim *
 				registeredMessage = fmt.Sprintf("Node did not register within %v (attempt %d/%d); retrying", registrationTimeout, attempts, maxLaunchAttempts)
 			}
 
-			meta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
-				Type:               kubenodesmithv1alpha1.ConditionTypeRegistered,
-				Status:             metav1.ConditionFalse,
-				Reason:             "Timeout",
-				Message:            registeredMessage,
-				ObservedGeneration: claim.Generation,
-			})
-
-			if maxAttemptsReached {
-				meta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
-					Type:               kubenodesmithv1alpha1.ConditionTypeLaunched,
+			if err := r.updateStatus(ctx, claim, func(updated *kubenodesmithv1alpha1.NodeSmithClaim) {
+				updated.Status.ProviderID = ""
+				meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
+					Type:               kubenodesmithv1alpha1.ConditionTypeRegistered,
 					Status:             metav1.ConditionFalse,
-					Reason:             "RegistrationTimeoutExceeded",
+					Reason:             "Timeout",
 					Message:            registeredMessage,
-					ObservedGeneration: claim.Generation,
-				})
-				meta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
-					Type:               kubenodesmithv1alpha1.ConditionTypeFailed,
-					Status:             metav1.ConditionTrue,
-					Reason:             "RegistrationTimeoutExceeded",
-					Message:            registeredMessage,
-					ObservedGeneration: claim.Generation,
+					ObservedGeneration: updated.Generation,
 				})
 
-				if err := r.Status().Update(ctx, claim); err != nil {
-					logger.Error(err, "failed to update status after exhausting registration retries")
-					return &ctrl.Result{}, err
+				if maxAttemptsReached {
+					meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
+						Type:               kubenodesmithv1alpha1.ConditionTypeLaunched,
+						Status:             metav1.ConditionFalse,
+						Reason:             "RegistrationTimeoutExceeded",
+						Message:            registeredMessage,
+						ObservedGeneration: updated.Generation,
+					})
+					meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
+						Type:               kubenodesmithv1alpha1.ConditionTypeFailed,
+						Status:             metav1.ConditionTrue,
+						Reason:             "RegistrationTimeoutExceeded",
+						Message:            registeredMessage,
+						ObservedGeneration: updated.Generation,
+					})
+					return
 				}
 
-				r.Recorder.Eventf(claim, corev1.EventTypeWarning, "RegistrationFailed",
-					"Node did not register within %v after %d attempts; giving up", registrationTimeout, attempts)
-
-				return &ctrl.Result{}, nil
+				meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
+					Type:               kubenodesmithv1alpha1.ConditionTypeLaunched,
+					Status:             metav1.ConditionFalse,
+					Reason:             "RegistrationTimeout",
+					Message:            fmt.Sprintf("Cleared provider ID to retry launch (%d/%d)", attempts+1, maxLaunchAttempts),
+					ObservedGeneration: updated.Generation,
+				})
+			}); err != nil {
+				logger.Error(err, "failed to update status after registration timeout")
+				return &ctrl.Result{}, err
 			}
 
-			meta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
-				Type:               kubenodesmithv1alpha1.ConditionTypeLaunched,
-				Status:             metav1.ConditionFalse,
-				Reason:             "RegistrationTimeout",
-				Message:            fmt.Sprintf("Cleared provider ID to retry launch (%d/%d)", attempts+1, maxLaunchAttempts),
-				ObservedGeneration: claim.Generation,
-			})
-
-			if err := r.Status().Update(ctx, claim); err != nil {
-				logger.Error(err, "failed to update status after timeout")
-				return &ctrl.Result{}, err
+			if maxAttemptsReached {
+				r.Recorder.Eventf(claim, corev1.EventTypeWarning, "RegistrationFailed",
+					"Node did not register within %v after %d attempts; giving up", registrationTimeout, attempts)
+				return &ctrl.Result{}, nil
 			}
 
 			r.Recorder.Eventf(claim, corev1.EventTypeWarning, "RegistrationTimeout",
@@ -425,15 +433,15 @@ func (r *NodeClaimReconciler) reconcileInitialization(ctx context.Context, claim
 		}
 
 		// Initialized but not ready - set Ready condition
-		meta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
-			Type:               kubenodesmithv1alpha1.ConditionTypeReady,
-			Status:             metav1.ConditionTrue,
-			Reason:             "Ready",
-			Message:            "Claim is fully operational",
-			ObservedGeneration: claim.Generation,
-		})
-
-		if err := r.Status().Update(ctx, claim); err != nil {
+		if err := r.updateStatus(ctx, claim, func(updated *kubenodesmithv1alpha1.NodeSmithClaim) {
+			meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
+				Type:               kubenodesmithv1alpha1.ConditionTypeReady,
+				Status:             metav1.ConditionTrue,
+				Reason:             "Ready",
+				Message:            "Claim is fully operational",
+				ObservedGeneration: updated.Generation,
+			})
+		}); err != nil {
 			logger.Error(err, "failed to update Ready condition")
 			return &ctrl.Result{}, err
 		}
@@ -471,23 +479,23 @@ func (r *NodeClaimReconciler) reconcileInitialization(ctx context.Context, claim
 	// Node is ready!
 	logger.Info("node is ready", "nodeName", node.Name)
 
-	meta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
-		Type:               kubenodesmithv1alpha1.ConditionTypeInitialized,
-		Status:             metav1.ConditionTrue,
-		Reason:             "Initialized",
-		Message:            "Node is ready",
-		ObservedGeneration: claim.Generation,
-	})
+	if err := r.updateStatus(ctx, claim, func(updated *kubenodesmithv1alpha1.NodeSmithClaim) {
+		meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
+			Type:               kubenodesmithv1alpha1.ConditionTypeInitialized,
+			Status:             metav1.ConditionTrue,
+			Reason:             "Initialized",
+			Message:            "Node is ready",
+			ObservedGeneration: updated.Generation,
+		})
 
-	meta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
-		Type:               kubenodesmithv1alpha1.ConditionTypeReady,
-		Status:             metav1.ConditionTrue,
-		Reason:             "Ready",
-		Message:            "Claim is fully operational",
-		ObservedGeneration: claim.Generation,
-	})
-
-	if err := r.Status().Update(ctx, claim); err != nil {
+		meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
+			Type:               kubenodesmithv1alpha1.ConditionTypeReady,
+			Status:             metav1.ConditionTrue,
+			Reason:             "Ready",
+			Message:            "Claim is fully operational",
+			ObservedGeneration: updated.Generation,
+		})
+	}); err != nil {
 		logger.Error(err, "failed to update status after initialization")
 		return &ctrl.Result{}, err
 	}
@@ -653,6 +661,34 @@ func (r *NodeClaimReconciler) getProviderForClaim(ctx context.Context, claim *ku
 	)
 
 	return providerInstance, nil
+}
+
+func (r *NodeClaimReconciler) updateStatus(
+	ctx context.Context,
+	claim *kubenodesmithv1alpha1.NodeSmithClaim,
+	mutate func(*kubenodesmithv1alpha1.NodeSmithClaim),
+) error {
+	key := types.NamespacedName{Namespace: claim.Namespace, Name: claim.Name}
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		var latest kubenodesmithv1alpha1.NodeSmithClaim
+		if err := r.Get(ctx, key, &latest); err != nil {
+			return err
+		}
+		original := latest.Status.DeepCopy()
+		if original == nil {
+			original = &kubenodesmithv1alpha1.NodeSmithClaimStatus{}
+		}
+		mutate(&latest)
+		if apiequality.Semantic.DeepEqual(original, &latest.Status) {
+			claim.Status = latest.Status
+			return nil
+		}
+		if err := r.Status().Update(ctx, &latest); err != nil {
+			return err
+		}
+		claim.Status = latest.Status
+		return nil
+	})
 }
 
 // SetupWithManager sets up the controller with the Manager.
