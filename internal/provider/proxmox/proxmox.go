@@ -431,7 +431,7 @@ func (p *Provider) ProvisionMachine(ctx context.Context, spec provider.MachineSp
 	}
 
 	return &provider.Machine{
-		ProviderID:   spec.MachineName,
+		ProviderID:   fmt.Sprintf("proxmox://%s", spec.MachineName),
 		KubeNodeName: spec.MachineName,
 	}, nil
 }

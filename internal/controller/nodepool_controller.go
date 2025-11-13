@@ -107,16 +107,6 @@ func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		logger.Error(err, "failed to list nodes in pool", "pool", nodePool.Name)
 	}
 
-	// List/print nodes in pool for debugging
-	// REMOVE_LATER
-	for _, node := range nodesInPool {
-		logger.V(1).Info("node in pool",
-			"node", node.Name,
-			"labels", node.Labels,
-			"taints", node.Spec.Taints,
-		)
-	}
-
 	if len(pods) != 0 {
 		// Scale up to accommodate unschedulable pods
 		result, err := r.reconcileScaleUp(ctx, &nodePool, cs, pods, nodesInPool)
@@ -265,17 +255,6 @@ func (r *NodePoolReconciler) reconcileScaleUp(
 			logger.Error(updateErr, "failed to update status after claim list failure")
 		}
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
-	}
-
-	// Debug print all claims
-	// REMOVE_LATER
-	for _, claim := range claims.Items {
-		logger.V(1).Info("existing claim",
-			"claim", claim.Name,
-			"poolRef", claim.Spec.PoolRef,
-			"nodeName", claim.Status.NodeName,
-			"idempotencyKey", claim.Spec.IdempotencyKey,
-		)
 	}
 
 	// Count inflight (pending) claims
