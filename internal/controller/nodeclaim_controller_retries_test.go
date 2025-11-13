@@ -9,6 +9,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	clientrecord "k8s.io/client-go/tools/record"
@@ -317,5 +318,90 @@ func TestReconcileRegistrationMarksFailedAfterMaxAttempts(t *testing.T) {
 
 	if claim.Status.ProviderID != "" {
 		t.Fatalf("expected providerID to be cleared on failure, got %q", claim.Status.ProviderID)
+	}
+}
+
+func TestReconcileRegistrationAppliesPoolLabels(t *testing.T) {
+	scheme := newTestScheme(t)
+
+	claim := &kubenodesmithv1alpha1.NodeSmithClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "claim-labels",
+			Namespace:       "default",
+			ResourceVersion: "1",
+		},
+		Spec: kubenodesmithv1alpha1.NodeSmithClaimSpec{
+			PoolRef: "pool-labels",
+		},
+		Status: kubenodesmithv1alpha1.NodeSmithClaimStatus{
+			ProviderID: "provider-123",
+		},
+	}
+
+	pool := &kubenodesmithv1alpha1.NodeSmithPool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "pool-labels",
+			Namespace:       "default",
+			ResourceVersion: "1",
+		},
+		Spec: kubenodesmithv1alpha1.NodeSmithPoolSpec{
+			ProviderRef: "provider",
+			Limits: kubenodesmithv1alpha1.NodePoolLimits{
+				MinNodes:  0,
+				MaxNodes:  0,
+				CPUCores:  0,
+				MemoryMiB: 0,
+			},
+			MachineTemplate: kubenodesmithv1alpha1.MachineTemplate{
+				Labels: map[string]string{
+					"node-role.kubernetes.io/worker": "true",
+				},
+			},
+		},
+	}
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "claim-labels",
+		},
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&kubenodesmithv1alpha1.NodeSmithClaim{}).
+		WithObjects(claim.DeepCopy(), pool, node).
+		Build()
+
+	reconciler := &NodeClaimReconciler{
+		Client:   client,
+		Scheme:   scheme,
+		Recorder: clientrecord.NewFakeRecorder(10),
+	}
+
+	ctx := context.Background()
+	result, err := reconciler.reconcileRegistration(ctx, claim)
+	if err != nil {
+		t.Fatalf("reconcileRegistration returned error: %v", err)
+	}
+	if result != nil {
+		t.Fatalf("expected nil result on successful registration, got %#v", result)
+	}
+
+	var updatedNode corev1.Node
+	if err := client.Get(ctx, types.NamespacedName{Name: node.Name}, &updatedNode); err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+
+	const poolLabelKey = "topology.kubenodesmith.io/pool"
+	if updatedNode.Labels[poolLabelKey] != pool.Name {
+		t.Fatalf("expected pool label %s=%s, got %v", poolLabelKey, pool.Name, updatedNode.Labels)
+	}
+
+	if updatedNode.Labels["node-role.kubernetes.io/worker"] != "true" {
+		t.Fatalf("expected template label to be applied, got %v", updatedNode.Labels)
+	}
+
+	if claim.Status.NodeName != node.Name {
+		t.Fatalf("expected claim status NodeName set to %s, got %s", node.Name, claim.Status.NodeName)
 	}
 }

@@ -45,3 +45,6 @@ go.work
 *.swp
 *.swo
 *~
+
+# Misc
+notes/

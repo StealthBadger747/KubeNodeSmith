@@ -96,7 +96,7 @@ func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 	}
 
-	pods, err := kube.GetUnschedulablePods(ctx, cs)
+	unschedulablePods, err := kube.GetUnschedulablePods(ctx, cs)
 	if err != nil {
 		logger.Error(err, "list unschedulable pods")
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
@@ -107,9 +107,9 @@ func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		logger.Error(err, "failed to list nodes in pool", "pool", nodePool.Name)
 	}
 
-	if len(pods) != 0 {
+	if len(unschedulablePods) != 0 {
 		// Scale up to accommodate unschedulable pods
-		result, err := r.reconcileScaleUp(ctx, &nodePool, cs, pods, nodesInPool)
+		result, err := r.reconcileScaleUp(ctx, &nodePool, cs, unschedulablePods, nodesInPool)
 		if err != nil || result.RequeueAfter > 0 {
 			return result, err
 		}

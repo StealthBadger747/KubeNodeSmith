@@ -468,7 +468,7 @@ func findNodeByVMName(vmName string, ctx context.Context, proxClient *proxmoxapi
 			}
 		}
 	}
-	return nil, nil, fmt.Errorf("VM with name %s not found", vmName)
+	return nil, nil, fmt.Errorf("VM with name '%s' not found", vmName)
 }
 
 // DeprovisionMachine deletes a VM previously created by ProvisionMachine.

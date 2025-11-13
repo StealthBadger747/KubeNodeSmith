@@ -287,6 +287,18 @@ func (r *NodeClaimReconciler) reconcileRegistration(ctx context.Context, claim *
 		if node.Name == expectedNodeName || nodeMatchesClaim(node, claim) {
 			// Found it!
 			logger.Info("node registered", "nodeName", node.Name)
+
+			pool, err := r.getPoolForClaim(ctx, claim)
+			if err != nil {
+				logger.Error(err, "failed to fetch pool for node labeling")
+				return &ctrl.Result{RequeueAfter: requeueRegistration}, err
+			}
+
+			if err := r.ensureNodeLabels(ctx, node, pool); err != nil {
+				logger.Error(err, "failed to ensure node labels", "nodeName", node.Name)
+				return &ctrl.Result{RequeueAfter: requeueRegistration}, err
+			}
+
 			claim.Status.NodeName = node.Name
 			claim.Status.LaunchAttempts = 0
 			meta.RemoveStatusCondition(&claim.Status.Conditions, kubenodesmithv1alpha1.ConditionTypeFailed)
@@ -329,7 +341,8 @@ func (r *NodeClaimReconciler) reconcileRegistration(ctx context.Context, claim *
 				logger.Error(err, "failed to get provider for deprovisioning after timeout")
 			} else {
 				machine := provider.Machine{
-					ProviderID: claim.Status.ProviderID,
+					ProviderID:   claim.Status.ProviderID,
+					KubeNodeName: claim.Status.NodeName,
 				}
 				if err := prov.DeprovisionMachine(ctx, machine); err != nil {
 					logger.Error(err, "failed to deprovision machine after timeout")
@@ -609,6 +622,50 @@ func nodeMatchesClaim(node *corev1.Node, claim *kubenodesmithv1alpha1.NodeSmithC
 		}
 	}
 	return false
+}
+
+func (r *NodeClaimReconciler) getPoolForClaim(ctx context.Context, claim *kubenodesmithv1alpha1.NodeSmithClaim) (*kubenodesmithv1alpha1.NodeSmithPool, error) {
+	var pool kubenodesmithv1alpha1.NodeSmithPool
+	key := types.NamespacedName{Namespace: claim.Namespace, Name: claim.Spec.PoolRef}
+	if err := r.Get(ctx, key, &pool); err != nil {
+		return nil, fmt.Errorf("get pool %s: %w", key.String(), err)
+	}
+	return &pool, nil
+}
+
+func (r *NodeClaimReconciler) ensureNodeLabels(
+	ctx context.Context,
+	node *corev1.Node,
+	pool *kubenodesmithv1alpha1.NodeSmithPool,
+) error {
+	labelKey := pool.Spec.PoolLabelKey
+	if strings.TrimSpace(labelKey) == "" {
+		labelKey = "topology.kubenodesmith.io/pool"
+	}
+
+	desired := node.DeepCopy()
+	if desired.Labels == nil {
+		desired.Labels = map[string]string{}
+	}
+
+	changed := false
+	if desired.Labels[labelKey] != pool.Name {
+		desired.Labels[labelKey] = pool.Name
+		changed = true
+	}
+
+	for k, v := range pool.Spec.MachineTemplate.Labels {
+		if existing, ok := desired.Labels[k]; !ok || existing != v {
+			desired.Labels[k] = v
+			changed = true
+		}
+	}
+
+	if !changed {
+		return nil
+	}
+
+	return r.Patch(ctx, desired, client.MergeFrom(node))
 }
 
 // getProviderForClaim retrieves the provider instance for a claim by looking up its pool and provider.
