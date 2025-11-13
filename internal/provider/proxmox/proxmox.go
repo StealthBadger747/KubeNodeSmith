@@ -406,7 +406,9 @@ func (p *Provider) ProvisionMachine(ctx context.Context, spec provider.MachineSp
 
 	fmt.Printf("New VMID: %d, on proxmox node: %s\n", newVMID, proxNode.Name)
 
-	machineName := fmt.Sprintf("%s-%d", spec.NamePrefix, newVMID)
+	// machineName := fmt.Sprintf("%s-%d", spec.NamePrefix, newVMID)
+	// TODO: If this works out then we need to remove NamePrefix, it should just be machineName
+	machineName := spec.NamePrefix
 
 	vmOptions, err := buildVirtualMachineOptions(machineName, spec, p.opts)
 	if err != nil {

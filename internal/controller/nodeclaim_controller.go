@@ -188,9 +188,9 @@ func (r *NodeClaimReconciler) reconcileLaunch(ctx context.Context, claim *kubeno
 		return &ctrl.Result{RequeueAfter: requeueOnError}, err
 	}
 
-	// Build the machine spec
-	spec := provider.MachineSpec{
-		NamePrefix: fmt.Sprintf("%s-%s", claim.Spec.PoolRef, claim.Name),
+	// Build the machine machineSpec
+	machineSpec := provider.MachineSpec{
+		NamePrefix: claim.Name,
 		CPUCores:   claim.Spec.Requirements.CPUCores,
 		MemoryMiB:  claim.Spec.Requirements.MemoryMiB,
 	}
@@ -199,7 +199,7 @@ func (r *NodeClaimReconciler) reconcileLaunch(ctx context.Context, claim *kubeno
 	claim.Status.LaunchAttempts = nextAttempt
 
 	// Provision the machine
-	machine, err := prov.ProvisionMachine(ctx, spec)
+	machine, err := prov.ProvisionMachine(ctx, machineSpec)
 	if err != nil {
 		logger.Error(err, "failed to provision machine")
 		meta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
@@ -272,7 +272,7 @@ func (r *NodeClaimReconciler) reconcileRegistration(ctx context.Context, claim *
 
 	// Try to find the node (using name matching for now)
 	// In production, use: node.Spec.ProviderID == claim.Status.ProviderID
-	expectedNodeName := fmt.Sprintf("%s-%s", claim.Spec.PoolRef, claim.Name)
+	expectedNodeName := claim.Name // TODO: Change to providerID matching when ready
 	for i := range nodes.Items {
 		node := &nodes.Items[i]
 		// TODO: Change to providerID matching when ready
