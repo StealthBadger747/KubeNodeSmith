@@ -15,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -155,12 +156,40 @@ func (r *ControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	})
 
 	if !apiequality.Semantic.DeepEqual(originalStatus, &controllerObj.Status) {
-		if err := r.Status().Update(ctx, &controllerObj); err != nil {
+		if err := r.updateStatus(ctx, &controllerObj); err != nil {
 			return ctrl.Result{}, fmt.Errorf("update NodeSmithControlPlane status: %w", err)
 		}
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func (r *ControlPlaneReconciler) updateStatus(ctx context.Context, cp *kubenodesmithv1alpha1.NodeSmithControlPlane) error {
+	statusCopy := cp.Status.DeepCopy()
+	if statusCopy == nil {
+		statusCopy = &kubenodesmithv1alpha1.NodeSmithControlPlaneStatus{}
+	}
+	key := types.NamespacedName{Namespace: cp.Namespace, Name: cp.Name}
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		var latest kubenodesmithv1alpha1.NodeSmithControlPlane
+		if err := r.Get(ctx, key, &latest); err != nil {
+			return err
+		}
+		original := latest.Status.DeepCopy()
+		if original == nil {
+			original = &kubenodesmithv1alpha1.NodeSmithControlPlaneStatus{}
+		}
+		latest.Status = *statusCopy
+		if apiequality.Semantic.DeepEqual(original, &latest.Status) {
+			cp.Status = latest.Status
+			return nil
+		}
+		if err := r.Status().Update(ctx, &latest); err != nil {
+			return err
+		}
+		cp.Status = latest.Status
+		return nil
+	})
 }
 
 // SetupWithManager sets up the controller with the Manager.

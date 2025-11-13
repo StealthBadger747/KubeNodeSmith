@@ -9,6 +9,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -197,18 +199,18 @@ func (r *NodePoolReconciler) reconcileScaleDown(
 			}
 
 			now := metav1.Now()
-			nodePool.Status.LastScaleActivity = &now
-			nodePool.Status.ObservedGeneration = nodePool.Generation
-
-			meta.SetStatusCondition(&nodePool.Status.Conditions, metav1.Condition{
-				Type:               "Progressing",
-				Status:             metav1.ConditionTrue,
-				Reason:             "ScalingDown",
-				Message:            fmt.Sprintf("Deleted claim %s for node %s", targetClaim.Name, candidateNode.Name),
-				ObservedGeneration: nodePool.Generation,
-			})
-
-			if err := r.Status().Update(ctx, nodePool); err != nil {
+			scaleDownMessage := fmt.Sprintf("Deleted claim %s for node %s", targetClaim.Name, candidateNode.Name)
+			if err := r.updateStatus(ctx, nodePool, func(p *kubenodesmithv1alpha1.NodeSmithPool) {
+				p.Status.LastScaleActivity = &now
+				p.Status.ObservedGeneration = p.Generation
+				meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
+					Type:               "Progressing",
+					Status:             metav1.ConditionTrue,
+					Reason:             "ScalingDown",
+					Message:            scaleDownMessage,
+					ObservedGeneration: p.Generation,
+				})
+			}); err != nil {
 				logger.Error(err, "failed to update pool status after scale down")
 				return ctrl.Result{}, err
 			}
@@ -240,14 +242,16 @@ func (r *NodePoolReconciler) reconcileScaleUp(
 		client.InNamespace(nodePool.Namespace),
 	); err != nil {
 		logger.Error(err, "list NodeSmithClaims for pool")
-		meta.SetStatusCondition(&nodePool.Status.Conditions, metav1.Condition{
-			Type:               "Available",
-			Status:             metav1.ConditionUnknown,
-			Reason:             "ClaimListFailed",
-			Message:            fmt.Sprintf("Failed to list claims: %v", err),
-			ObservedGeneration: nodePool.Generation,
-		})
-		if updateErr := r.Status().Update(ctx, nodePool); updateErr != nil {
+		message := fmt.Sprintf("Failed to list claims: %v", err)
+		if updateErr := r.updateStatus(ctx, nodePool, func(p *kubenodesmithv1alpha1.NodeSmithPool) {
+			meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
+				Type:               "Available",
+				Status:             metav1.ConditionUnknown,
+				Reason:             "ClaimListFailed",
+				Message:            message,
+				ObservedGeneration: p.Generation,
+			})
+		}); updateErr != nil {
 			logger.Error(updateErr, "failed to update status after claim list failure")
 		}
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
@@ -273,14 +277,15 @@ func (r *NodePoolReconciler) reconcileScaleUp(
 			"Pool at max capacity: %d/%d nodes (including %d pending)",
 			nodePoolSize, nodePool.Spec.Limits.MaxNodes, pendingCount)
 
-		meta.SetStatusCondition(&nodePool.Status.Conditions, metav1.Condition{
-			Type:               "Available",
-			Status:             metav1.ConditionFalse,
-			Reason:             "MaxNodesReached",
-			Message:            fmt.Sprintf("Pool at maximum capacity: %d nodes", nodePoolSize),
-			ObservedGeneration: nodePool.Generation,
-		})
-		if updateErr := r.Status().Update(ctx, nodePool); updateErr != nil {
+		if updateErr := r.updateStatus(ctx, nodePool, func(p *kubenodesmithv1alpha1.NodeSmithPool) {
+			meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
+				Type:               "Available",
+				Status:             metav1.ConditionFalse,
+				Reason:             "MaxNodesReached",
+				Message:            fmt.Sprintf("Pool at maximum capacity: %d nodes", nodePoolSize),
+				ObservedGeneration: p.Generation,
+			})
+		}); updateErr != nil {
 			logger.Error(updateErr, "failed to update status for max nodes condition")
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
@@ -334,14 +339,15 @@ func (r *NodePoolReconciler) reconcileScaleUp(
 		logger.Info("skipping scale up due to resource limits", "reason", reason)
 		r.Recorder.Eventf(nodePool, corev1.EventTypeWarning, "ScaleUpBlocked", reason)
 
-		meta.SetStatusCondition(&nodePool.Status.Conditions, metav1.Condition{
-			Type:               "Available",
-			Status:             metav1.ConditionFalse,
-			Reason:             "ResourceLimitReached",
-			Message:            reason,
-			ObservedGeneration: nodePool.Generation,
-		})
-		if updateErr := r.Status().Update(ctx, nodePool); updateErr != nil {
+		if updateErr := r.updateStatus(ctx, nodePool, func(p *kubenodesmithv1alpha1.NodeSmithPool) {
+			meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
+				Type:               "Available",
+				Status:             metav1.ConditionFalse,
+				Reason:             "ResourceLimitReached",
+				Message:            reason,
+				ObservedGeneration: p.Generation,
+			})
+		}); updateErr != nil {
 			logger.Error(updateErr, "failed to update status for resource limit condition")
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
@@ -355,18 +361,18 @@ func (r *NodePoolReconciler) reconcileScaleUp(
 
 	// Update status with scale activity timestamp
 	now := metav1.Now()
-	nodePool.Status.LastScaleActivity = &now
-	nodePool.Status.ObservedGeneration = nodePool.Generation
-
-	meta.SetStatusCondition(&nodePool.Status.Conditions, metav1.Condition{
-		Type:               "Progressing",
-		Status:             metav1.ConditionTrue,
-		Reason:             "ScalingUp",
-		Message:            fmt.Sprintf("Created claim for pod %s/%s", pod.Namespace, pod.Name),
-		ObservedGeneration: nodePool.Generation,
-	})
-
-	if err := r.Status().Update(ctx, nodePool); err != nil {
+	scaleUpMessage := fmt.Sprintf("Created claim for pod %s/%s", pod.Namespace, pod.Name)
+	if err := r.updateStatus(ctx, nodePool, func(p *kubenodesmithv1alpha1.NodeSmithPool) {
+		p.Status.LastScaleActivity = &now
+		p.Status.ObservedGeneration = p.Generation
+		meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
+			Type:               "Progressing",
+			Status:             metav1.ConditionTrue,
+			Reason:             "ScalingUp",
+			Message:            scaleUpMessage,
+			ObservedGeneration: p.Generation,
+		})
+	}); err != nil {
 		logger.Error(err, "failed to update pool status")
 		return ctrl.Result{}, err
 	}
@@ -453,6 +459,34 @@ func generateIdempotencyKey(poolName, podUID string, cpuCores, memMiB int64) str
 	input := fmt.Sprintf("%s:%s:%d:%d", poolName, podUID, cpuCores, memMiB)
 	sum := sha1.Sum([]byte(input))
 	return hex.EncodeToString(sum[:])
+}
+
+func (r *NodePoolReconciler) updateStatus(
+	ctx context.Context,
+	pool *kubenodesmithv1alpha1.NodeSmithPool,
+	mutate func(*kubenodesmithv1alpha1.NodeSmithPool),
+) error {
+	key := types.NamespacedName{Namespace: pool.Namespace, Name: pool.Name}
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		var latest kubenodesmithv1alpha1.NodeSmithPool
+		if err := r.Get(ctx, key, &latest); err != nil {
+			return err
+		}
+		original := latest.Status.DeepCopy()
+		if original == nil {
+			original = &kubenodesmithv1alpha1.NodeSmithPoolStatus{}
+		}
+		mutate(&latest)
+		if apiequality.Semantic.DeepEqual(original, &latest.Status) {
+			pool.Status = latest.Status
+			return nil
+		}
+		if err := r.Status().Update(ctx, &latest); err != nil {
+			return err
+		}
+		pool.Status = latest.Status
+		return nil
+	})
 }
 
 // exceedsPoolLimits verifies if adding a new node with the specified resources would exceed pool limits
