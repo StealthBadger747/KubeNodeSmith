@@ -459,7 +459,6 @@ func getAllPodsOnNode(ctx context.Context, clientset *kubernetes.Clientset, node
 }
 
 func GetScaleDownCandidates(ctx context.Context, clientset *kubernetes.Clientset, nodePool *kubenodesmithv1alpha1.NodeSmithPool) ([]corev1.Node, error) {
-	nodePrefix := nodePool.Spec.MachineTemplate.KubeNodeNamePrefix
 	nodepoolKey := nodePool.Spec.PoolLabelKey
 	nodepoolValue := nodePool.Name
 
@@ -471,10 +470,6 @@ func GetScaleDownCandidates(ctx context.Context, clientset *kubernetes.Clientset
 	candidates := make([]corev1.Node, 0, len(nodes))
 
 	for _, node := range nodes {
-		// Only collect nodes that are auto-scaled
-		if !strings.HasPrefix(node.Name, nodePrefix+"-") {
-			continue
-		}
 		if node.Spec.Unschedulable {
 			continue
 		}

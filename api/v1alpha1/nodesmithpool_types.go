@@ -32,8 +32,7 @@ type NodePoolLimits struct {
 
 // MachineTemplate captures metadata for nodes provisioned into the pool.
 type MachineTemplate struct {
-	KubeNodeNamePrefix string            `json:"kubeNodeNamePrefix"`
-	Labels             map[string]string `json:"labels,omitempty"`
+	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // ScaleUpPolicy controls expansion behaviour.

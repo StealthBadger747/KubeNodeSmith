@@ -71,14 +71,10 @@ spec:
                 description: MachineTemplate captures metadata for nodes provisioned
                   into the pool.
                 properties:
-                  kubeNodeNamePrefix:
-                    type: string
                   labels:
                     additionalProperties:
                       type: string
                     type: object
-                required:
-                - kubeNodeNamePrefix
                 type: object
               poolLabelKey:
                 default: topology.kubenodesmith.io/pool

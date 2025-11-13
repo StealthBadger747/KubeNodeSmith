@@ -142,7 +142,9 @@ func TestReconcileRegistrationRetriesAfterTimeout(t *testing.T) {
 				MemoryMiB: 0,
 			},
 			MachineTemplate: kubenodesmithv1alpha1.MachineTemplate{
-				KubeNodeNamePrefix: "pool-node",
+				Labels: map[string]string{
+					"node-role.kubernetes.io/worker": "",
+				},
 			},
 		},
 	}
@@ -252,7 +254,9 @@ func TestReconcileRegistrationMarksFailedAfterMaxAttempts(t *testing.T) {
 				MemoryMiB: 0,
 			},
 			MachineTemplate: kubenodesmithv1alpha1.MachineTemplate{
-				KubeNodeNamePrefix: "pool-node",
+				Labels: map[string]string{
+					"node-role.kubernetes.io/worker": "",
+				},
 			},
 		},
 	}

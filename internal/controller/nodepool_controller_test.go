@@ -44,7 +44,9 @@ var _ = Describe("NodePool controller", func() {
 							MemoryMiB: 8192,
 						},
 						MachineTemplate: kubenodesmithv1alpha1.MachineTemplate{
-							KubeNodeNamePrefix: "default-node",
+							Labels: map[string]string{
+								"node-role.kubernetes.io/worker": "",
+							},
 						},
 					},
 				}
