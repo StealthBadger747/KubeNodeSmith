@@ -133,21 +133,6 @@ func (r *NodePoolReconciler) reconcileScaleDown(
 ) (ctrl.Result, error) {
 	logger := logf.FromContext(ctx).WithValues("pool", nodePool.Name)
 
-	// Check stabilization window if configured
-	if nodePool.Spec.ScaleDown != nil && nodePool.Spec.ScaleDown.StabilizationWindow != nil {
-		if nodePool.Status.LastScaleActivity != nil {
-			timeSinceLastScale := time.Since(nodePool.Status.LastScaleActivity.Time)
-			if timeSinceLastScale < nodePool.Spec.ScaleDown.StabilizationWindow.Duration {
-				remaining := nodePool.Spec.ScaleDown.StabilizationWindow.Duration - timeSinceLastScale
-				logger.V(1).Info("within scale-down stabilization window, deferring",
-					"timeSinceLastScale", timeSinceLastScale,
-					"remaining", remaining,
-				)
-				return ctrl.Result{RequeueAfter: remaining}, nil
-			}
-		}
-	}
-
 	if nodePool.Spec.Limits.MinNodes > 0 && len(nodesInPool) <= nodePool.Spec.Limits.MinNodes {
 		logger.V(1).Info("node pool at or below min size; skipping scale down",
 			"minNodes", nodePool.Spec.Limits.MinNodes,
@@ -163,6 +148,21 @@ func (r *NodePoolReconciler) reconcileScaleDown(
 	}
 
 	if len(nodes) != 0 {
+		// Only enforce stabilization window when we have actual candidates to remove
+		if nodePool.Spec.ScaleDown != nil && nodePool.Spec.ScaleDown.StabilizationWindow != nil {
+			if nodePool.Status.LastScaleActivity != nil {
+				timeSinceLastScale := time.Since(nodePool.Status.LastScaleActivity.Time)
+				if timeSinceLastScale < nodePool.Spec.ScaleDown.StabilizationWindow.Duration {
+					remaining := nodePool.Spec.ScaleDown.StabilizationWindow.Duration - timeSinceLastScale
+					logger.V(1).Info("within scale-down stabilization window, deferring",
+						"timeSinceLastScale", timeSinceLastScale,
+						"remaining", remaining,
+					)
+					return ctrl.Result{RequeueAfter: remaining}, nil
+				}
+			}
+		}
+
 		for _, candidateNode := range nodes {
 			logger.Info("scaling down node", "node", candidateNode.Name)
 
