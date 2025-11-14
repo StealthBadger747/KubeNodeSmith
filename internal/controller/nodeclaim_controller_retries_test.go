@@ -401,7 +401,37 @@ func TestReconcileRegistrationAppliesPoolLabels(t *testing.T) {
 		t.Fatalf("expected template label to be applied, got %v", updatedNode.Labels)
 	}
 
+	if updatedNode.Labels["kubenodesmith.io/nodeclaim"] != claim.Name {
+		t.Fatalf("expected claim label to be applied, got %v", updatedNode.Labels)
+	}
+
 	if claim.Status.NodeName != node.Name {
 		t.Fatalf("expected claim status NodeName set to %s, got %s", node.Name, claim.Status.NodeName)
+	}
+}
+
+func TestNodeMatchesClaimUsesExplicitLabel(t *testing.T) {
+	claim := &kubenodesmithv1alpha1.NodeSmithClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "claim-1",
+		},
+	}
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node-a",
+			Labels: map[string]string{
+				"topology.kubenodesmith.io/pool": "pool-a",
+			},
+		},
+	}
+
+	if nodeMatchesClaim(node, claim) {
+		t.Fatalf("expected node without kubenodesmith.io/nodeclaim label not to match")
+	}
+
+	node.Labels["kubenodesmith.io/nodeclaim"] = "claim-1"
+	if !nodeMatchesClaim(node, claim) {
+		t.Fatalf("expected node with kubenodesmith.io/nodeclaim label to match claim")
 	}
 }

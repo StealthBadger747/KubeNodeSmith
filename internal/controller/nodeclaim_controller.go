@@ -294,7 +294,7 @@ func (r *NodeClaimReconciler) reconcileRegistration(ctx context.Context, claim *
 				return &ctrl.Result{RequeueAfter: requeueRegistration}, err
 			}
 
-			if err := r.ensureNodeLabels(ctx, node, pool); err != nil {
+			if err := r.ensureNodeLabels(ctx, node, pool, claim); err != nil {
 				logger.Error(err, "failed to ensure node labels", "nodeName", node.Name)
 				return &ctrl.Result{RequeueAfter: requeueRegistration}, err
 			}
@@ -614,10 +614,8 @@ func (r *NodeClaimReconciler) finalize(ctx context.Context, claim *kubenodesmith
 // nodeMatchesClaim attempts to match a node to a claim using heuristics.
 // TODO: Replace with providerID matching when implemented.
 func nodeMatchesClaim(node *corev1.Node, claim *kubenodesmithv1alpha1.NodeSmithClaim) bool {
-	// Check if node has the pool label
-	if poolLabel, ok := node.Labels["topology.kubenodesmith.io/pool"]; ok {
-		if poolLabel == claim.Spec.PoolRef {
-			// TODO: Add more specific matching criteria
+	if node.Labels != nil {
+		if claimLabel, ok := node.Labels["kubenodesmith.io/nodeclaim"]; ok && claimLabel == claim.Name {
 			return true
 		}
 	}
@@ -637,6 +635,7 @@ func (r *NodeClaimReconciler) ensureNodeLabels(
 	ctx context.Context,
 	node *corev1.Node,
 	pool *kubenodesmithv1alpha1.NodeSmithPool,
+	claim *kubenodesmithv1alpha1.NodeSmithClaim,
 ) error {
 	labelKey := pool.Spec.PoolLabelKey
 	if strings.TrimSpace(labelKey) == "" {
@@ -651,6 +650,11 @@ func (r *NodeClaimReconciler) ensureNodeLabels(
 	changed := false
 	if desired.Labels[labelKey] != pool.Name {
 		desired.Labels[labelKey] = pool.Name
+		changed = true
+	}
+
+	if desired.Labels["kubenodesmith.io/nodeclaim"] != claim.Name {
+		desired.Labels["kubenodesmith.io/nodeclaim"] = claim.Name
 		changed = true
 	}
 
