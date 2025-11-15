@@ -3,6 +3,7 @@ package proxmox
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net/http"
@@ -49,6 +50,8 @@ type Provider struct {
 }
 
 const proxmoxStatusOnline = "online"
+
+var errVMNotFound = errors.New("proxmox: vm not found")
 
 // Endpoint returns the API endpoint configured for this provider.
 func (p *Provider) Endpoint() string {
@@ -386,6 +389,24 @@ func buildVirtualMachineOptions(machineName string, spec provider.MachineSpec, o
 
 // ProvisionMachine creates a new VM in the Proxmox cluster that will eventually join the Kubernetes cluster.
 func (p *Provider) ProvisionMachine(ctx context.Context, spec provider.MachineSpec) (*provider.Machine, error) {
+	// Idempotency: if a VM with this machine name already exists, reuse it
+	if _, existingVM, err := findNodeByVMName(spec.MachineName, ctx, &p.client); err == nil {
+		fmt.Printf("Found existing VM %s on node %s; reusing\n", spec.MachineName, existingVM.Node)
+		if !existingVM.IsRunning() {
+			if task, startErr := existingVM.Start(ctx); startErr != nil {
+				return nil, fmt.Errorf("start existing vm %s: %w", spec.MachineName, startErr)
+			} else if waitErr := task.WaitFor(ctx, 600); waitErr != nil {
+				return nil, fmt.Errorf("wait for existing vm %s start: %w", spec.MachineName, waitErr)
+			}
+		}
+		return &provider.Machine{
+			ProviderID:   fmt.Sprintf("proxmox://%s", spec.MachineName),
+			KubeNodeName: spec.MachineName,
+		}, nil
+	} else if err != nil && !errors.Is(err, errVMNotFound) {
+		return nil, fmt.Errorf("check existing vm: %w", err)
+	}
+
 	cluster, err := p.client.Cluster(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("get cluster: %w", err)
@@ -468,13 +489,16 @@ func findNodeByVMName(vmName string, ctx context.Context, proxClient *proxmoxapi
 			}
 		}
 	}
-	return nil, nil, fmt.Errorf("VM with name '%s' not found", vmName)
+	return nil, nil, errVMNotFound
 }
 
 // DeprovisionMachine deletes a VM previously created by ProvisionMachine.
 func (p *Provider) DeprovisionMachine(ctx context.Context, machine provider.Machine) error {
 	_, proxVM, err := findNodeByVMName(machine.KubeNodeName, ctx, &p.client)
 	if err != nil {
+		if errors.Is(err, errVMNotFound) {
+			return fmt.Errorf("VM with name '%s' not found", machine.KubeNodeName)
+		}
 		return err
 	}
 

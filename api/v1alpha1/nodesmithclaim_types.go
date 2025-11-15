@@ -91,6 +91,31 @@ type NodeSmithClaimStatus struct {
 	// is marked as Failed and reconciliation stops.
 	// +optional
 	LaunchAttempts int `json:"launchAttempts,omitempty"`
+
+	// lease tracks long-running operations that need coordination (e.g. provisioning, draining).
+	// Controllers use this lease to coordinate work and recover from crashes by treating expired leases as abandoned.
+	// +optional
+	Lease *NodeSmithClaimLease `json:"lease,omitempty"`
+}
+
+// NodeSmithClaimLease represents a soft lock held while performing long-running work on a claim.
+type NodeSmithClaimLease struct {
+	// holder identifies the controller instance currently holding the lease.
+	// +optional
+	Holder string `json:"holder,omitempty"`
+	// phase describes the lifecycle phase guarded by this lease (e.g., "Launching", "Draining").
+	// +optional
+	Phase string `json:"phase,omitempty"`
+	// started records when the lease was first acquired.
+	// +optional
+	Started metav1.Time `json:"started,omitempty"`
+	// lastHeartbeat records the last time the holder refreshed the lease.
+	// +optional
+	LastHeartbeat metav1.Time `json:"lastHeartbeat,omitempty"`
+	// timeoutSeconds bounds how long the lease may remain valid without a heartbeat before other
+	// controllers consider it expired and attempt to recover the claim.
+	// +optional
+	TimeoutSeconds int32 `json:"timeoutSeconds,omitempty"`
 }
 
 // +kubebuilder:object:root=true

@@ -148,6 +148,7 @@ func (r *NodePoolReconciler) reconcileScaleDown(
 	}
 
 	if len(nodes) != 0 {
+		// TODO: detect pool-labeled nodes that lost their claims (e.g. host crash) and recycle them.
 		// Only enforce stabilization window when we have actual candidates to remove
 		if nodePool.Spec.ScaleDown != nil && nodePool.Spec.ScaleDown.StabilizationWindow != nil {
 			if nodePool.Status.LastScaleActivity != nil {

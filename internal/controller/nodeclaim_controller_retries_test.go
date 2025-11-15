@@ -410,6 +410,106 @@ func TestReconcileRegistrationAppliesPoolLabels(t *testing.T) {
 	}
 }
 
+func TestReconcileLaunchSkipsWhenProviderIDPresent(t *testing.T) {
+	scheme := newTestScheme(t)
+
+	claim := &kubenodesmithv1alpha1.NodeSmithClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "claim-launched",
+			Namespace:       "default",
+			ResourceVersion: "1",
+		},
+		Spec: kubenodesmithv1alpha1.NodeSmithClaimSpec{
+			PoolRef: "pool",
+		},
+		Status: kubenodesmithv1alpha1.NodeSmithClaimStatus{
+			ProviderID:     "proxmox://claim-launched",
+			LaunchAttempts: 1,
+			Conditions: []metav1.Condition{
+				{
+					Type:   kubenodesmithv1alpha1.ConditionTypeLaunched,
+					Status: metav1.ConditionTrue,
+				},
+			},
+		},
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&kubenodesmithv1alpha1.NodeSmithClaim{}).
+		WithObjects(claim.DeepCopy()).
+		Build()
+
+	reconciler := &NodeClaimReconciler{
+		Client:   client,
+		Scheme:   scheme,
+		Recorder: clientrecord.NewFakeRecorder(10),
+	}
+
+	ctx := context.Background()
+	result, err := reconciler.reconcileLaunch(ctx, claim)
+	if err != nil {
+		t.Fatalf("reconcileLaunch returned error: %v", err)
+	}
+	if result != nil {
+		t.Fatalf("expected nil result when providerID already set, got %#v", result)
+	}
+
+	if claim.Status.ProviderID != "proxmox://claim-launched" {
+		t.Fatalf("expected providerID to remain unchanged, got %s", claim.Status.ProviderID)
+	}
+}
+
+func TestReconcileLaunchDefersWhenLeaseHeld(t *testing.T) {
+	scheme := newTestScheme(t)
+	now := metav1.Now()
+
+	claim := &kubenodesmithv1alpha1.NodeSmithClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "claim-lease",
+			Namespace:       "default",
+			ResourceVersion: "1",
+		},
+		Spec: kubenodesmithv1alpha1.NodeSmithClaimSpec{
+			PoolRef: "pool",
+			Requirements: &kubenodesmithv1alpha1.NodeSmithClaimRequirements{
+				CPUCores:  1,
+				MemoryMiB: 1024,
+			},
+		},
+		Status: kubenodesmithv1alpha1.NodeSmithClaimStatus{
+			Lease: &kubenodesmithv1alpha1.NodeSmithClaimLease{
+				Holder:         "other-controller",
+				Phase:          "Launching",
+				Started:        now,
+				LastHeartbeat:  now,
+				TimeoutSeconds: 600,
+			},
+		},
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&kubenodesmithv1alpha1.NodeSmithClaim{}).
+		WithObjects(claim.DeepCopy()).
+		Build()
+
+	reconciler := &NodeClaimReconciler{
+		Client:   client,
+		Scheme:   scheme,
+		Recorder: clientrecord.NewFakeRecorder(10),
+	}
+
+	ctx := context.Background()
+	result, err := reconciler.reconcileLaunch(ctx, claim)
+	if err != nil {
+		t.Fatalf("reconcileLaunch returned error: %v", err)
+	}
+	if result == nil || result.RequeueAfter <= 0 {
+		t.Fatalf("expected requeue when lease is held, got %#v", result)
+	}
+}
+
 func TestNodeMatchesClaimUsesExplicitLabel(t *testing.T) {
 	claim := &kubenodesmithv1alpha1.NodeSmithClaim{
 		ObjectMeta: metav1.ObjectMeta{

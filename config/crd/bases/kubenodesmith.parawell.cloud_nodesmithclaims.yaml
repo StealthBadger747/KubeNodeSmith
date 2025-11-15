@@ -147,6 +147,35 @@ spec:
                   a machine for this claim. After exceeding the max retry count, the claim
                   is marked as Failed and reconciliation stops.
                 type: integer
+              lease:
+                description: |-
+                  lease tracks long-running operations that need coordination (e.g. provisioning, draining).
+                  Controllers use this lease to coordinate work and recover from crashes by treating expired leases as abandoned.
+                properties:
+                  holder:
+                    description: holder identifies the controller instance currently
+                      holding the lease.
+                    type: string
+                  lastHeartbeat:
+                    description: lastHeartbeat records the last time the holder refreshed
+                      the lease.
+                    format: date-time
+                    type: string
+                  phase:
+                    description: phase describes the lifecycle phase guarded by this
+                      lease (e.g., "Launching", "Draining").
+                    type: string
+                  started:
+                    description: started records when the lease was first acquired.
+                    format: date-time
+                    type: string
+                  timeoutSeconds:
+                    description: |-
+                      timeoutSeconds bounds how long the lease may remain valid without a heartbeat before other
+                      controllers consider it expired and attempt to recover the claim.
+                    format: int32
+                    type: integer
+                type: object
               nodeName:
                 description: |-
                   nodeName is the name of the Kubernetes Node object that corresponds to this claim.

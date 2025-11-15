@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -37,6 +38,11 @@ const (
 	requeueInitialization = 10 * time.Second
 	requeueOnError        = time.Minute
 	requeueFinalization   = 5 * time.Second
+
+	leasePhaseLaunching    = "Launching"
+	launchLeaseTimeout     = 10 * time.Minute
+	leaseHeartbeatInterval = 10 * time.Second
+	minLeaseRetryDelay     = 2 * time.Second
 )
 
 // NodeClaimReconciler reconciles a NodeSmithClaim object.
@@ -45,6 +51,7 @@ type NodeClaimReconciler struct {
 	Scheme            *runtime.Scheme
 	Recorder          record.EventRecorder
 	ProviderFactories map[string]ProviderBuilder
+	leaseHolderID     string
 }
 
 // +kubebuilder:rbac:groups=kubenodesmith.parawell.cloud,resources=nodesmithclaims,verbs=get;list;watch;create;update;patch;delete
@@ -118,9 +125,51 @@ func (r *NodeClaimReconciler) reconcileLaunch(ctx context.Context, claim *kubeno
 
 	// Already launched? Check providerID
 	if claim.Status.ProviderID != "" {
-		// Machine already provisioned, move to next phase
-		return nil, nil
+		logger.V(1).Info("claim already has provider ID, skipping launch", "providerID", claim.Status.ProviderID)
+		return nil, nil // Machine already provisioned, move to next phase
 	}
+
+	// Respect any in-progress launch lease
+	if lease := claim.Status.Lease; lease != nil && lease.Phase == leasePhaseLaunching {
+		if leaseExpired(lease) {
+			logger.Info("launch lease expired, clearing", "previousHolder", lease.Holder)
+			if err := r.releaseLease(ctx, claim, leasePhaseLaunching); err != nil {
+				logger.Error(err, "failed to clear expired launch lease")
+				return &ctrl.Result{RequeueAfter: requeueOnError}, err
+			}
+		} else if lease.Holder != r.getLeaseHolderID() {
+			remaining := leaseRemaining(lease)
+			if remaining < minLeaseRetryDelay {
+				remaining = minLeaseRetryDelay
+			}
+			logger.V(1).Info("launch lease currently held by another worker",
+				"holder", lease.Holder,
+				"remaining", remaining,
+			)
+			return &ctrl.Result{RequeueAfter: remaining}, nil
+		} else {
+			remaining := leaseRemaining(lease)
+			if remaining < leaseHeartbeatInterval {
+				remaining = leaseHeartbeatInterval
+			}
+			logger.V(1).Info("launch already in progress by current worker", "remaining", remaining)
+			return &ctrl.Result{RequeueAfter: remaining}, nil
+		}
+	}
+
+	leaseCancel, err := r.acquireLease(ctx, claim, leasePhaseLaunching, launchLeaseTimeout)
+	if err != nil {
+		logger.Error(err, "failed to acquire launch lease")
+		return &ctrl.Result{RequeueAfter: requeueOnError}, err
+	}
+	defer func() {
+		if leaseCancel != nil {
+			leaseCancel()
+		}
+		if err := r.releaseLease(context.Background(), claim, leasePhaseLaunching); err != nil {
+			logger.Error(err, "failed to release launch lease")
+		}
+	}()
 
 	if claim.Status.LaunchAttempts >= maxLaunchAttempts {
 		launchCond := meta.FindStatusCondition(claim.Status.Conditions, kubenodesmithv1alpha1.ConditionTypeLaunched)
@@ -240,8 +289,6 @@ func (r *NodeClaimReconciler) reconcileLaunch(ctx context.Context, claim *kubeno
 		})
 	}); err != nil {
 		logger.Error(err, "failed to update status after launch")
-		// CRITICAL: If this fails, next reconcile will retry provisioning
-		// Provider MUST be idempotent (return existing machine for same idempotency key)
 		return &ctrl.Result{}, err
 	}
 
@@ -673,6 +720,114 @@ func (r *NodeClaimReconciler) ensureNodeLabels(
 	return r.Patch(ctx, desired, client.MergeFrom(node))
 }
 
+func (r *NodeClaimReconciler) getLeaseHolderID() string {
+	if r.leaseHolderID != "" {
+		return r.leaseHolderID
+	}
+	if pod := os.Getenv("POD_NAME"); pod != "" {
+		r.leaseHolderID = pod
+		return pod
+	}
+	if host, err := os.Hostname(); err == nil {
+		r.leaseHolderID = host
+		return host
+	}
+	r.leaseHolderID = "kubenodesmith-controller"
+	return r.leaseHolderID
+}
+
+func leaseExpired(lease *kubenodesmithv1alpha1.NodeSmithClaimLease) bool {
+	if lease == nil || lease.TimeoutSeconds <= 0 {
+		return true
+	}
+	return time.Since(leaseReferenceTime(lease)) > time.Duration(lease.TimeoutSeconds)*time.Second
+}
+
+func leaseRemaining(lease *kubenodesmithv1alpha1.NodeSmithClaimLease) time.Duration {
+	if lease == nil || lease.TimeoutSeconds <= 0 {
+		return 0
+	}
+	deadline := leaseReferenceTime(lease).Add(time.Duration(lease.TimeoutSeconds) * time.Second)
+	return time.Until(deadline)
+}
+
+func leaseReferenceTime(lease *kubenodesmithv1alpha1.NodeSmithClaimLease) time.Time {
+	ref := lease.LastHeartbeat.Time
+	if ref.IsZero() {
+		ref = lease.Started.Time
+	}
+	return ref
+}
+
+func (r *NodeClaimReconciler) acquireLease(
+	ctx context.Context,
+	claim *kubenodesmithv1alpha1.NodeSmithClaim,
+	phase string,
+	timeout time.Duration,
+) (context.CancelFunc, error) {
+	holder := r.getLeaseHolderID()
+	now := metav1.Now()
+	seconds := int32(timeout.Seconds())
+	if seconds <= 0 {
+		seconds = int32(launchLeaseTimeout.Seconds())
+	}
+	if err := r.updateStatus(ctx, claim, func(updated *kubenodesmithv1alpha1.NodeSmithClaim) {
+		updated.Status.Lease = &kubenodesmithv1alpha1.NodeSmithClaimLease{
+			Holder:         holder,
+			Phase:          phase,
+			Started:        now,
+			LastHeartbeat:  now,
+			TimeoutSeconds: seconds,
+		}
+	}); err != nil {
+		return nil, err
+	}
+
+	heartbeatCtx, cancel := context.WithCancel(context.Background())
+	go r.runLeaseHeartbeat(heartbeatCtx, types.NamespacedName{Namespace: claim.Namespace, Name: claim.Name}, phase, timeout/3)
+	return cancel, nil
+}
+
+func (r *NodeClaimReconciler) runLeaseHeartbeat(
+	ctx context.Context,
+	key types.NamespacedName,
+	phase string,
+	interval time.Duration,
+) {
+	if interval <= 0 {
+		interval = leaseHeartbeatInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			hbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = r.updateStatusByKey(hbCtx, key, func(claim *kubenodesmithv1alpha1.NodeSmithClaim) {
+				if claim.Status.Lease != nil && claim.Status.Lease.Phase == phase {
+					claim.Status.Lease.LastHeartbeat = metav1.Now()
+				}
+			})
+			cancel()
+		}
+	}
+}
+
+func (r *NodeClaimReconciler) releaseLease(
+	ctx context.Context,
+	claim *kubenodesmithv1alpha1.NodeSmithClaim,
+	phase string,
+) error {
+	return r.updateStatus(ctx, claim, func(updated *kubenodesmithv1alpha1.NodeSmithClaim) {
+		if updated.Status.Lease != nil && updated.Status.Lease.Phase == phase {
+			updated.Status.Lease = nil
+		}
+	})
+}
+
 // getProviderForClaim retrieves the provider instance for a claim by looking up its pool and provider.
 func (r *NodeClaimReconciler) getProviderForClaim(ctx context.Context, claim *kubenodesmithv1alpha1.NodeSmithClaim) (provider.Provider, error) {
 	logger := logf.FromContext(ctx)
@@ -750,6 +905,28 @@ func (r *NodeClaimReconciler) updateStatus(
 		}
 		claim.Status = latest.Status
 		return nil
+	})
+}
+
+func (r *NodeClaimReconciler) updateStatusByKey(
+	ctx context.Context,
+	key types.NamespacedName,
+	mutate func(*kubenodesmithv1alpha1.NodeSmithClaim),
+) error {
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		var latest kubenodesmithv1alpha1.NodeSmithClaim
+		if err := r.Get(ctx, key, &latest); err != nil {
+			return err
+		}
+		original := latest.Status.DeepCopy()
+		if original == nil {
+			original = &kubenodesmithv1alpha1.NodeSmithClaimStatus{}
+		}
+		mutate(&latest)
+		if apiequality.Semantic.DeepEqual(original, &latest.Status) {
+			return nil
+		}
+		return r.Status().Update(ctx, &latest)
 	})
 }
 
