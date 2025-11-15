@@ -581,7 +581,8 @@ func (r *NodeClaimReconciler) finalize(ctx context.Context, claim *kubenodesmith
 			// but the warning event provides visibility for manual intervention
 		} else {
 			machine := provider.Machine{
-				ProviderID: claim.Status.ProviderID,
+				ProviderID:   claim.Status.ProviderID,
+				KubeNodeName: claim.Status.NodeName,
 			}
 			if err := prov.DeprovisionMachine(ctx, machine); err != nil {
 				logger.Error(err, "failed to deprovision machine",
