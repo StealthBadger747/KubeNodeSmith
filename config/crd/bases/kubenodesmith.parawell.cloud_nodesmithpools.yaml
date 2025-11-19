@@ -173,6 +173,9 @@ spec:
               lastScaleActivity:
                 format: date-time
                 type: string
+              nextClaimSequence:
+                format: int64
+                type: integer
               observedGeneration:
                 format: int64
                 type: integer

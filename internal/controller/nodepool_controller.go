@@ -2,10 +2,10 @@ package controller
 
 import (
 	"context"
-	"crypto/sha1"
-	"encoding/hex"
 	"fmt"
 	"math"
+	"sort"
+	"strconv"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -13,8 +13,10 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
@@ -30,6 +32,27 @@ import (
 const (
 	FinalizerNodeSmithPool = "kubenodesmith.io/nodepool"
 )
+
+type nodeCapacity struct {
+	cpuMilli int64
+	memBytes int64
+}
+
+type capacityBucket struct {
+	remainingCPU int64
+	remainingMem int64
+}
+
+type claimResources struct {
+	cpuCores  int64
+	memoryMiB int64
+}
+
+type podDemand struct {
+	pod      corev1.Pod
+	cpuMilli int64
+	memBytes int64
+}
 
 // NodePoolReconciler reconciles a NodeSmithPool object.
 type NodePoolReconciler struct {
@@ -237,53 +260,66 @@ func (r *NodePoolReconciler) reconcileScaleUp(
 ) (ctrl.Result, error) {
 	logger := logf.FromContext(ctx).WithValues("pool", nodePool.Name)
 
-	// List all claims for this pool
+	candidatePods := filterPodsForPool(unschedulablePods, nodePool)
+	if len(candidatePods) == 0 {
+		logger.V(1).Info("no unschedulable pods targeting pool; skipping scale up")
+		return ctrl.Result{}, nil
+	}
+
 	var claims kubenodesmithv1alpha1.NodeSmithClaimList
-	if err := r.List(ctx, &claims,
-		client.InNamespace(nodePool.Namespace),
-	); err != nil {
+	if err := r.List(ctx, &claims, client.InNamespace(nodePool.Namespace)); err != nil {
 		logger.Error(err, "list NodeSmithClaims for pool")
-		message := fmt.Sprintf("Failed to list claims: %v", err)
-		if updateErr := r.updateStatus(ctx, nodePool, func(p *kubenodesmithv1alpha1.NodeSmithPool) {
-			meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
-				Type:               "Available",
-				Status:             metav1.ConditionUnknown,
-				Reason:             "ClaimListFailed",
-				Message:            message,
-				ObservedGeneration: p.Generation,
-			})
-		}); updateErr != nil {
-			logger.Error(updateErr, "failed to update status after claim list failure")
-		}
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 
-	// Count inflight (pending) claims
+	nodeTemplate := determineNodeCapacity(nodesInPool, &claims, candidatePods)
+	if nodeTemplate.cpuMilli == 0 || nodeTemplate.memBytes == 0 {
+		logger.Info("unable to determine node capacity for pool; skipping scale up")
+		return ctrl.Result{}, nil
+	}
+
+	nodeBuckets, err := buildNodeBuckets(ctx, cs, nodesInPool)
+	if err != nil {
+		logger.Error(err, "failed to compute node capacity")
+		return ctrl.Result{RequeueAfter: time.Minute}, nil
+	}
+
+	pendingBuckets := buildPendingClaimBuckets(&claims, nodePool.Name)
+	buckets := append(nodeBuckets, pendingBuckets...)
+
+	newClaimSpecs := planCapacity(candidatePods, buckets, nodeTemplate)
+	if len(newClaimSpecs) == 0 {
+		logger.V(1).Info("existing capacity sufficient; skipping scale up")
+		return ctrl.Result{}, nil
+	}
+
 	pendingCount, pendingCPUMilli, pendingMemBytes, err := countInflightClaims(nodePool, &claims)
 	if err != nil {
 		logger.Error(err, "count inflight claims")
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 
-	nodePoolSize := len(nodesInPool) + pendingCount
+	poolUsage, err := kube.GetPoolResourceUsage(ctx, cs, nodePool)
+	if err != nil {
+		logger.Error(err, "get pool resource usage")
+		return ctrl.Result{RequeueAfter: time.Minute}, nil
+	}
 
-	// Check max node limit
-	if nodePool.Spec.Limits.MaxNodes > 0 && nodePoolSize >= nodePool.Spec.Limits.MaxNodes {
+	currentNodes := len(nodesInPool)
+	if nodePool.Spec.Limits.MaxNodes > 0 && currentNodes+pendingCount+len(newClaimSpecs) > nodePool.Spec.Limits.MaxNodes {
+		msg := fmt.Sprintf("Pool at max capacity: %d/%d nodes (including %d pending)", currentNodes+pendingCount, nodePool.Spec.Limits.MaxNodes, pendingCount)
 		logger.Info("node pool at or above max size; skipping scale up",
 			"maxNodes", nodePool.Spec.Limits.MaxNodes,
-			"currentNodes", len(nodesInPool),
+			"currentNodes", currentNodes,
 			"pendingClaims", pendingCount,
 		)
-		r.Recorder.Eventf(nodePool, corev1.EventTypeWarning, "ScaleUpBlocked",
-			"Pool at max capacity: %d/%d nodes (including %d pending)",
-			nodePoolSize, nodePool.Spec.Limits.MaxNodes, pendingCount)
-
+		r.Recorder.Eventf(nodePool, corev1.EventTypeWarning, "ScaleUpBlocked", msg)
 		if updateErr := r.updateStatus(ctx, nodePool, func(p *kubenodesmithv1alpha1.NodeSmithPool) {
 			meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
 				Type:               "Available",
 				Status:             metav1.ConditionFalse,
 				Reason:             "MaxNodesReached",
-				Message:            fmt.Sprintf("Pool at maximum capacity: %d nodes", nodePoolSize),
+				Message:            msg,
 				ObservedGeneration: p.Generation,
 			})
 		}); updateErr != nil {
@@ -292,54 +328,15 @@ func (r *NodePoolReconciler) reconcileScaleUp(
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
-	// Check stabilization window if configured
-	if nodePool.Spec.ScaleUp != nil && nodePool.Spec.ScaleUp.StabilizationWindow != nil {
-		if nodePool.Status.LastScaleActivity != nil {
-			timeSinceLastScale := time.Since(nodePool.Status.LastScaleActivity.Time)
-			if timeSinceLastScale < nodePool.Spec.ScaleUp.StabilizationWindow.Duration {
-				remaining := nodePool.Spec.ScaleUp.StabilizationWindow.Duration - timeSinceLastScale
-				logger.V(1).Info("within stabilization window, deferring scale up",
-					"timeSinceLastScale", timeSinceLastScale,
-					"remaining", remaining,
-				)
-				return ctrl.Result{RequeueAfter: remaining}, nil
-			}
-		}
+	var newCPUMilli, newMemBytes int64
+	for _, spec := range newClaimSpecs {
+		newCPUMilli += spec.cpuCores * 1000
+		newMemBytes += spec.memoryMiB * 1024 * 1024
 	}
 
-	// Pick the first unschedulable pod to provision for
-	pod := unschedulablePods[0]
-	cpuMilli, memBytes := kube.GetRequestedResources(&pod)
-	cpu := int64(math.Ceil(float64(cpuMilli) / 1000))
-	memMiB := memBytes / (1024 * 1024)
-
-	logger.Info("found unschedulable pod requiring capacity",
-		"pod", pod.Name,
-		"namespace", pod.Namespace,
-		"cpuCores", cpu,
-		"memoryMiB", memMiB,
-	)
-
-	// Get current pool resource usage
-	poolUsage, err := kube.GetPoolResourceUsage(ctx, cs, nodePool)
-	if err != nil {
-		logger.Error(err, "get pool resource usage")
-		return ctrl.Result{RequeueAfter: time.Minute}, nil
-	}
-
-	logger.V(1).Info("pool resource snapshot",
-		"nodes", poolUsage.NodeCount,
-		"allocatableCPUMilli", poolUsage.AllocatableCPUMilli,
-		"allocatableMemoryBytes", poolUsage.AllocatableMemoryBytes,
-		"availableCPUMilli", poolUsage.AvailableCPUMilli,
-		"availableMemoryBytes", poolUsage.AvailableMemoryBytes,
-	)
-
-	// Check if adding a new node would exceed pool resource limits
-	if exceeded, reason := exceedsPoolLimits(poolUsage, &nodePool.Spec.Limits, pendingCPUMilli, pendingMemBytes, cpuMilli, memBytes); exceeded {
+	if exceeded, reason := exceedsPoolLimits(poolUsage, &nodePool.Spec.Limits, pendingCPUMilli, pendingMemBytes, newCPUMilli, newMemBytes); exceeded {
 		logger.Info("skipping scale up due to resource limits", "reason", reason)
 		r.Recorder.Eventf(nodePool, corev1.EventTypeWarning, "ScaleUpBlocked", reason)
-
 		if updateErr := r.updateStatus(ctx, nodePool, func(p *kubenodesmithv1alpha1.NodeSmithPool) {
 			meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
 				Type:               "Available",
@@ -354,23 +351,35 @@ func (r *NodePoolReconciler) reconcileScaleUp(
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
-	// Create NodeSmithClaim
-	if err := r.createClaim(ctx, nodePool, pod, cpu, memMiB); err != nil {
-		logger.Error(err, "failed to create claim")
-		return ctrl.Result{RequeueAfter: time.Minute}, err
+	nextSeq := nodePool.Status.NextClaimSequence
+	if nextSeq <= 0 {
+		nextSeq = 1
+	}
+	created := 0
+	for _, spec := range newClaimSpecs {
+		claimName := fmt.Sprintf("%s-%06d", nodePool.Name, nextSeq)
+		nextSeq++
+		if err := r.ensureClaim(ctx, nodePool, claimName, spec); err != nil {
+			logger.Error(err, "failed to create NodeSmithClaim", "claim", claimName)
+			return ctrl.Result{RequeueAfter: time.Minute}, err
+		}
+		created++
 	}
 
-	// Update status with scale activity timestamp
+	if created == 0 {
+		return ctrl.Result{}, nil
+	}
+
 	now := metav1.Now()
-	scaleUpMessage := fmt.Sprintf("Created claim for pod %s/%s", pod.Namespace, pod.Name)
 	if err := r.updateStatus(ctx, nodePool, func(p *kubenodesmithv1alpha1.NodeSmithPool) {
 		p.Status.LastScaleActivity = &now
 		p.Status.ObservedGeneration = p.Generation
+		p.Status.NextClaimSequence = nextSeq
 		meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
 			Type:               "Progressing",
 			Status:             metav1.ConditionTrue,
 			Reason:             "ScalingUp",
-			Message:            scaleUpMessage,
+			Message:            fmt.Sprintf("Created %d new claims for %d pending pods", created, len(candidatePods)),
 			ObservedGeneration: p.Generation,
 		})
 	}); err != nil {
@@ -378,88 +387,343 @@ func (r *NodePoolReconciler) reconcileScaleUp(
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("successfully initiated scale up",
-		"pod", pod.Name,
-		"cpuCores", cpu,
-		"memoryMiB", memMiB,
-	)
-
 	r.Recorder.Eventf(nodePool, corev1.EventTypeNormal, "ScaledUp",
-		"Created claim to accommodate pod %s/%s (CPU: %d cores, Memory: %d MiB)",
-		pod.Namespace, pod.Name, cpu, memMiB)
+		"Created %d NodeSmithClaims to accommodate pending pods", created)
 
 	return ctrl.Result{}, nil
 }
 
-// createClaim creates a NodeSmithClaim for the given pod's resource requirements.
-func (r *NodePoolReconciler) createClaim(
+func (r *NodePoolReconciler) ensureClaim(
 	ctx context.Context,
 	nodePool *kubenodesmithv1alpha1.NodeSmithPool,
-	pod corev1.Pod,
-	cpu, memMiB int64,
+	claimName string,
+	resources claimResources,
 ) error {
-	logger := logf.FromContext(ctx)
-
-	idempotencyKey := generateIdempotencyKey(nodePool.Name, string(pod.UID), cpu, memMiB)
-	claimName := fmt.Sprintf("%s-%s", nodePool.Name, idempotencyKey[:10])
-
-	// Check if claim already exists
-	var existingClaim kubenodesmithv1alpha1.NodeSmithClaim
-	existingKey := types.NamespacedName{Namespace: nodePool.Namespace, Name: claimName}
-	if err := r.Get(ctx, existingKey, &existingClaim); err == nil {
-		if existingClaim.Spec.IdempotencyKey == idempotencyKey {
-			logger.Info("reusing existing NodeSmithClaim", "claim", existingClaim.Name)
-			return nil
-		}
-		return fmt.Errorf("claim name collision: %s", claimName)
+	key := types.NamespacedName{Namespace: nodePool.Namespace, Name: claimName}
+	var existing kubenodesmithv1alpha1.NodeSmithClaim
+	if err := r.Get(ctx, key, &existing); err == nil {
+		return nil
 	} else if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("failed to check for existing claim: %w", err)
+		return fmt.Errorf("get existing claim %s: %w", claimName, err)
 	}
 
-	// Create new claim
+	labels := map[string]string{}
+	if nodePool.Spec.PoolLabelKey != "" {
+		labels[nodePool.Spec.PoolLabelKey] = nodePool.Name
+	}
+	for k, v := range nodePool.Spec.MachineTemplate.Labels {
+		labels[k] = v
+	}
+
 	claim := &kubenodesmithv1alpha1.NodeSmithClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      claimName,
 			Namespace: nodePool.Namespace,
-			Labels: map[string]string{
-				nodePool.Spec.PoolLabelKey: nodePool.Name,
-			},
+			Labels:    labels,
 		},
 		Spec: kubenodesmithv1alpha1.NodeSmithClaimSpec{
 			PoolRef: nodePool.Name,
 			Requirements: &kubenodesmithv1alpha1.NodeSmithClaimRequirements{
-				CPUCores:  cpu,
-				MemoryMiB: memMiB,
+				CPUCores:  resources.cpuCores,
+				MemoryMiB: resources.memoryMiB,
 			},
-			IdempotencyKey: idempotencyKey,
+			IdempotencyKey: string(uuid.NewUUID()),
 		},
 	}
 
 	if err := controllerutil.SetControllerReference(nodePool, claim, r.Scheme); err != nil {
-		return fmt.Errorf("failed to set owner reference: %w", err)
+		return fmt.Errorf("set owner reference: %w", err)
 	}
 
 	if err := r.Create(ctx, claim); err != nil {
 		if apierrors.IsAlreadyExists(err) {
-			// Race condition: another reconcile created it first
-			if err := r.Get(ctx, existingKey, &existingClaim); err == nil {
-				if existingClaim.Spec.IdempotencyKey == idempotencyKey {
-					logger.Info("another reconciler created the NodeSmithClaim first", "claim", existingClaim.Name)
-					return nil
-				}
-			}
+			return nil
 		}
-		return fmt.Errorf("failed to create claim: %w", err)
+		return fmt.Errorf("create claim %s: %w", claimName, err)
 	}
 
-	logger.Info("created NodeSmithClaim", "claim", claimName, "pod", pod.Name)
+	logf.FromContext(ctx).WithValues("pool", nodePool.Name).Info("created NodeSmithClaim", "claim", claimName)
 	return nil
 }
 
-func generateIdempotencyKey(poolName, podUID string, cpuCores, memMiB int64) string {
-	input := fmt.Sprintf("%s:%s:%d:%d", poolName, podUID, cpuCores, memMiB)
-	sum := sha1.Sum([]byte(input))
-	return hex.EncodeToString(sum[:])
+func filterPodsForPool(pods []corev1.Pod, pool *kubenodesmithv1alpha1.NodeSmithPool) []corev1.Pod {
+	labels := buildPoolLabelSet(pool)
+	results := make([]corev1.Pod, 0, len(pods))
+	for i := range pods {
+		pod := &pods[i]
+		matches, requires := podMatchesPool(pod, pool, labels)
+		if matches && requires {
+			results = append(results, *pod)
+		}
+	}
+	return results
+}
+
+func buildPoolLabelSet(pool *kubenodesmithv1alpha1.NodeSmithPool) map[string]string {
+	labels := map[string]string{}
+	if pool.Spec.PoolLabelKey != "" {
+		labels[pool.Spec.PoolLabelKey] = pool.Name
+	}
+	for k, v := range pool.Spec.MachineTemplate.Labels {
+		labels[k] = v
+	}
+	return labels
+}
+
+func podMatchesPool(pod *corev1.Pod, pool *kubenodesmithv1alpha1.NodeSmithPool, poolLabels map[string]string) (bool, bool) {
+	requiresPool := false
+	for key, val := range pod.Spec.NodeSelector {
+		labelVal, ok := poolLabels[key]
+		if !ok || labelVal != val {
+			return false, false
+		}
+		if key == pool.Spec.PoolLabelKey || pool.Spec.MachineTemplate.Labels[key] != "" {
+			requiresPool = true
+		}
+	}
+
+	required := pod.Spec.Affinity != nil && pod.Spec.Affinity.NodeAffinity != nil && pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil
+	if required {
+		terms := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+		if len(terms) > 0 {
+			termMatches := false
+			termRequires := false
+			for _, term := range terms {
+				ok, req := nodeSelectorTermMatches(term, pool, poolLabels)
+				if ok {
+					termMatches = true
+					if req {
+						termRequires = true
+					}
+					break
+				}
+			}
+			if !termMatches {
+				return false, false
+			}
+			requiresPool = requiresPool || termRequires
+		}
+	}
+
+	return true, requiresPool
+}
+
+func nodeSelectorTermMatches(term corev1.NodeSelectorTerm, pool *kubenodesmithv1alpha1.NodeSmithPool, labels map[string]string) (bool, bool) {
+	requiresPool := false
+	for _, expr := range term.MatchExpressions {
+		value, hasLabel := labels[expr.Key]
+		switch expr.Operator {
+		case corev1.NodeSelectorOpIn:
+			if !hasLabel || !containsString(expr.Values, value) {
+				return false, false
+			}
+		case corev1.NodeSelectorOpNotIn:
+			if hasLabel && containsString(expr.Values, value) {
+				return false, false
+			}
+		case corev1.NodeSelectorOpExists:
+			if !hasLabel {
+				return false, false
+			}
+		case corev1.NodeSelectorOpDoesNotExist:
+			if hasLabel {
+				return false, false
+			}
+		case corev1.NodeSelectorOpGt, corev1.NodeSelectorOpLt:
+			if !hasLabel {
+				return false, false
+			}
+			labelVal, err := strconv.ParseInt(value, 10, 64)
+			if err != nil {
+				return false, false
+			}
+			reqVal, err := strconv.ParseInt(expr.Values[0], 10, 64)
+			if err != nil {
+				return false, false
+			}
+			if expr.Operator == corev1.NodeSelectorOpGt && !(labelVal > reqVal) {
+				return false, false
+			}
+			if expr.Operator == corev1.NodeSelectorOpLt && !(labelVal < reqVal) {
+				return false, false
+			}
+		}
+		if expr.Key == pool.Spec.PoolLabelKey || pool.Spec.MachineTemplate.Labels[expr.Key] != "" {
+			requiresPool = true
+		}
+	}
+	return true, requiresPool
+}
+
+func containsString(list []string, target string) bool {
+	for _, v := range list {
+		if v == target {
+			return true
+		}
+	}
+	return false
+}
+
+func determineNodeCapacity(nodes []corev1.Node, claims *kubenodesmithv1alpha1.NodeSmithClaimList, pods []corev1.Pod) nodeCapacity {
+	if len(nodes) > 0 {
+		node := nodes[0]
+		cpu := int64(0)
+		mem := int64(0)
+		if v := node.Status.Allocatable.Cpu(); v != nil {
+			cpu = v.MilliValue()
+		}
+		if v := node.Status.Allocatable.Memory(); v != nil {
+			mem = v.Value()
+		}
+		return nodeCapacity{cpuMilli: cpu, memBytes: mem}
+	}
+	for i := range claims.Items {
+		claim := claims.Items[i]
+		if claim.Spec.Requirements == nil {
+			continue
+		}
+		if claim.Spec.Requirements.CPUCores > 0 && claim.Spec.Requirements.MemoryMiB > 0 {
+			cpu := claim.Spec.Requirements.CPUCores * 1000
+			mem := claim.Spec.Requirements.MemoryMiB * 1024 * 1024
+			return nodeCapacity{cpuMilli: cpu, memBytes: mem}
+		}
+	}
+	var fallback nodeCapacity
+	for i := range pods {
+		cpu, mem := kube.GetRequestedResources(&pods[i])
+		if cpu > fallback.cpuMilli {
+			fallback.cpuMilli = cpu
+		}
+		if mem > fallback.memBytes {
+			fallback.memBytes = mem
+		}
+	}
+	return fallback
+}
+
+func buildNodeBuckets(ctx context.Context, cs *kubernetes.Clientset, nodes []corev1.Node) ([]capacityBucket, error) {
+	buckets := make([]capacityBucket, 0, len(nodes))
+	for _, node := range nodes {
+		allocCPU := int64(0)
+		allocMem := int64(0)
+		if v := node.Status.Allocatable.Cpu(); v != nil {
+			allocCPU = v.MilliValue()
+		}
+		if v := node.Status.Allocatable.Memory(); v != nil {
+			allocMem = v.Value()
+		}
+		pods, err := listPodsOnNode(ctx, cs, node.Name)
+		if err != nil {
+			return nil, err
+		}
+		usedCPU := int64(0)
+		usedMem := int64(0)
+		for i := range pods {
+			cpu, mem := kube.GetRequestedResources(&pods[i])
+			usedCPU += cpu
+			usedMem += mem
+		}
+		remainingCPU := allocCPU - usedCPU
+		if remainingCPU < 0 {
+			remainingCPU = 0
+		}
+		remainingMem := allocMem - usedMem
+		if remainingMem < 0 {
+			remainingMem = 0
+		}
+		buckets = append(buckets, capacityBucket{remainingCPU: remainingCPU, remainingMem: remainingMem})
+	}
+	return buckets, nil
+}
+
+func buildPendingClaimBuckets(claims *kubenodesmithv1alpha1.NodeSmithClaimList, poolName string) []capacityBucket {
+	buckets := []capacityBucket{}
+	for i := range claims.Items {
+		claim := claims.Items[i]
+		if claim.Spec.PoolRef != poolName {
+			continue
+		}
+		readyCond := meta.FindStatusCondition(claim.Status.Conditions, kubenodesmithv1alpha1.ConditionTypeReady)
+		if readyCond != nil && readyCond.Status == metav1.ConditionTrue {
+			continue
+		}
+		if claim.Spec.Requirements == nil {
+			continue
+		}
+		cpu := claim.Spec.Requirements.CPUCores * 1000
+		mem := claim.Spec.Requirements.MemoryMiB * 1024 * 1024
+		buckets = append(buckets, capacityBucket{remainingCPU: cpu, remainingMem: mem})
+	}
+	return buckets
+}
+
+func planCapacity(pods []corev1.Pod, buckets []capacityBucket, template nodeCapacity) []claimResources {
+	demands := make([]podDemand, 0, len(pods))
+	for i := range pods {
+		cpu, mem := kube.GetRequestedResources(&pods[i])
+		if cpu == 0 && mem == 0 {
+			continue
+		}
+		demands = append(demands, podDemand{pod: pods[i], cpuMilli: cpu, memBytes: mem})
+	}
+	sort.SliceStable(demands, func(i, j int) bool {
+		return demands[i].cpuMilli > demands[j].cpuMilli
+	})
+	newClaims := make([]claimResources, 0)
+	for _, demand := range demands {
+		placed := false
+		for i := range buckets {
+			if buckets[i].remainingCPU >= demand.cpuMilli && buckets[i].remainingMem >= demand.memBytes {
+				buckets[i].remainingCPU -= demand.cpuMilli
+				buckets[i].remainingMem -= demand.memBytes
+				placed = true
+				break
+			}
+		}
+		if placed {
+			continue
+		}
+		capacityCPU := template.cpuMilli
+		if capacityCPU < demand.cpuMilli {
+			capacityCPU = demand.cpuMilli
+		}
+		capacityMem := template.memBytes
+		if capacityMem < demand.memBytes {
+			capacityMem = demand.memBytes
+		}
+		buckets = append(buckets, capacityBucket{
+			remainingCPU: capacityCPU - demand.cpuMilli,
+			remainingMem: capacityMem - demand.memBytes,
+		})
+		newClaims = append(newClaims, claimResources{
+			cpuCores:  int64(math.Ceil(float64(capacityCPU) / 1000.0)),
+			memoryMiB: int64(math.Ceil(float64(capacityMem) / (1024 * 1024))),
+		})
+	}
+	return newClaims
+}
+
+func listPodsOnNode(ctx context.Context, cs *kubernetes.Clientset, nodeName string) ([]corev1.Pod, error) {
+	list, err := cs.CoreV1().Pods("").List(ctx, metav1.ListOptions{
+		FieldSelector: fields.OneTermEqualSelector("spec.nodeName", nodeName).String(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]corev1.Pod, 0, len(list.Items))
+	for _, pod := range list.Items {
+		if _, ok := pod.Annotations["kubernetes.io/config.mirror"]; ok {
+			continue
+		}
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		result = append(result, pod)
+	}
+	return result, nil
 }
 
 func (r *NodePoolReconciler) updateStatus(

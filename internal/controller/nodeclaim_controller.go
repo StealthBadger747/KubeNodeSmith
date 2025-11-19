@@ -125,7 +125,6 @@ func (r *NodeClaimReconciler) reconcileLaunch(ctx context.Context, claim *kubeno
 
 	// Already launched? Check providerID
 	if claim.Status.ProviderID != "" {
-		logger.V(1).Info("claim already has provider ID, skipping launch", "providerID", claim.Status.ProviderID)
 		return nil, nil // Machine already provisioned, move to next phase
 	}
 

@@ -68,6 +68,7 @@ type NodeSmithPoolStatus struct {
 	Conditions         []metav1.Condition `json:"conditions,omitempty"`
 	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
 	LastScaleActivity  *metav1.Time       `json:"lastScaleActivity,omitempty"`
+	NextClaimSequence  int64              `json:"nextClaimSequence,omitempty"`
 }
 
 // +kubebuilder:object:root=true
