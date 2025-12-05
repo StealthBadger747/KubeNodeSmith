@@ -38,6 +38,10 @@ const (
 	requeueInitialization = 10 * time.Second
 	requeueOnError        = time.Minute
 	requeueFinalization   = 5 * time.Second
+	// If a node stays NotReady for this long after registration, treat it as lost and recycle.
+	readinessDegradeTimeout = 10 * time.Minute
+	// Periodic health check for already-ready claims so we can recycle stale nodes.
+	readyHealthCheckInterval = 2 * time.Minute
 
 	leasePhaseLaunching    = "Launching"
 	launchLeaseTimeout     = 10 * time.Minute
@@ -116,7 +120,7 @@ func (r *NodeClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	// All phases complete - claim is ready
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: readyHealthCheckInterval}, nil
 }
 
 // reconcileLaunch handles the machine provisioning phase.
@@ -209,6 +213,18 @@ func (r *NodeClaimReconciler) reconcileLaunch(ctx context.Context, claim *kubeno
 		// Launched but providerID lost? This shouldn't happen, but log it
 		logger.Info("claim marked as launched but missing providerID - possible data loss")
 		// TODO: Attempt to find machine by idempotency key from provider
+	}
+
+	// Ensure no conflicting node exists before launching
+	// This prevents race conditions where we provision a new machine while the old node
+	// from a previous attempt is still terminating.
+	var existingNode corev1.Node
+	if err := r.Get(ctx, types.NamespacedName{Name: claim.Name}, &existingNode); err == nil {
+		logger.Info("node with claim name still exists, waiting for deletion before relaunch", "nodeName", existingNode.Name)
+		return &ctrl.Result{RequeueAfter: requeueInitialization}, nil
+	} else if !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to check for existing node")
+		return &ctrl.Result{RequeueAfter: requeueOnError}, err
 	}
 
 	nextAttempt := claim.Status.LaunchAttempts + 1
@@ -331,6 +347,11 @@ func (r *NodeClaimReconciler) reconcileRegistration(ctx context.Context, claim *
 		// TODO: Change to providerID matching when ready
 		// if node.Spec.ProviderID == claim.Status.ProviderID {
 		if node.Name == expectedNodeName || nodeMatchesClaim(node, claim) {
+			// Skip nodes that are being deleted
+			if !node.DeletionTimestamp.IsZero() {
+				continue
+			}
+
 			// Found it!
 			logger.Info("node registered", "nodeName", node.Name)
 
@@ -482,40 +503,12 @@ func (r *NodeClaimReconciler) reconcileInitialization(ctx context.Context, claim
 		return nil, nil // Previous phase incomplete
 	}
 
-	// Already initialized?
-	initializedCond := meta.FindStatusCondition(claim.Status.Conditions, kubenodesmithv1alpha1.ConditionTypeInitialized)
-	if initializedCond != nil && initializedCond.Status == metav1.ConditionTrue {
-		// Check if Ready condition is also set
-		readyCond := meta.FindStatusCondition(claim.Status.Conditions, kubenodesmithv1alpha1.ConditionTypeReady)
-		if readyCond != nil && readyCond.Status == metav1.ConditionTrue {
-			return nil, nil // Fully ready, nothing to do
-		}
-
-		// Initialized but not ready - set Ready condition
-		if err := r.updateStatus(ctx, claim, func(updated *kubenodesmithv1alpha1.NodeSmithClaim) {
-			meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
-				Type:               kubenodesmithv1alpha1.ConditionTypeReady,
-				Status:             metav1.ConditionTrue,
-				Reason:             "Ready",
-				Message:            "Claim is fully operational",
-				ObservedGeneration: updated.Generation,
-			})
-		}); err != nil {
-			logger.Error(err, "failed to update Ready condition")
-			return &ctrl.Result{}, err
-		}
-
-		r.Recorder.Eventf(claim, corev1.EventTypeNormal, "Ready", "Claim is ready")
-		return nil, nil
-	}
-
 	// Get the node
 	var node corev1.Node
 	if err := r.Get(ctx, types.NamespacedName{Name: claim.Status.NodeName}, &node); err != nil {
 		if apierrors.IsNotFound(err) {
-			logger.Info("node not found - may have been deleted")
-			// Node disappeared - this is unexpected, requeue
-			return &ctrl.Result{RequeueAfter: requeueInitialization}, nil
+			logger.Info("node not found - treating as lost and recycling")
+			return r.recycleUnhealthyNode(ctx, claim, nil, "Node object missing; recycling claim")
 		}
 		logger.Error(err, "failed to get node")
 		return &ctrl.Result{RequeueAfter: requeueInitialization}, nil
@@ -531,6 +524,22 @@ func (r *NodeClaimReconciler) reconcileInitialization(ctx context.Context, claim
 	}
 
 	if !nodeReady {
+		var notReadyDuration time.Duration
+		for _, cond := range node.Status.Conditions {
+			if cond.Type == corev1.NodeReady {
+				if !cond.LastTransitionTime.IsZero() {
+					notReadyDuration = time.Since(cond.LastTransitionTime.Time)
+				}
+				break
+			}
+		}
+
+		if notReadyDuration > readinessDegradeTimeout {
+			logger.Info("node stuck NotReady; recycling claim", "nodeName", node.Name, "duration", notReadyDuration)
+			return r.recycleUnhealthyNode(ctx, claim, &node,
+				fmt.Sprintf("Node %s NotReady for %v; recycling", node.Name, readinessDegradeTimeout))
+		}
+
 		logger.V(1).Info("waiting for node to become ready", "nodeName", node.Name)
 		return &ctrl.Result{RequeueAfter: requeueInitialization}, nil
 	}
@@ -656,6 +665,108 @@ func (r *NodeClaimReconciler) finalize(ctx context.Context, claim *kubenodesmith
 
 	logger.Info("claim finalized successfully")
 	return ctrl.Result{}, nil
+}
+
+// recycleUnhealthyNode tears down a stuck/not-ready node and resets the claim so it can relaunch.
+func (r *NodeClaimReconciler) recycleUnhealthyNode(
+	ctx context.Context,
+	claim *kubenodesmithv1alpha1.NodeSmithClaim,
+	node *corev1.Node,
+	message string,
+) (*ctrl.Result, error) {
+	logger := logf.FromContext(ctx).WithValues("claim", claim.Name)
+
+	// Delete the K8s Node to clear conflicts for future joins
+	if node != nil {
+		logger.Info("deleting unhealthy node", "nodeName", node.Name)
+		if err := r.Delete(ctx, node); err != nil && !apierrors.IsNotFound(err) {
+			logger.Error(err, "failed to delete unhealthy node", "nodeName", node.Name)
+			return &ctrl.Result{RequeueAfter: requeueOnError}, err
+		}
+	}
+
+	// Attempt to deprovision the VM
+	if claim.Status.ProviderID != "" {
+		if prov, err := r.getProviderForClaim(ctx, claim); err != nil {
+			logger.Error(err, "failed to get provider while recycling", "providerID", claim.Status.ProviderID)
+		} else {
+			machine := provider.Machine{
+				ProviderID:   claim.Status.ProviderID,
+				KubeNodeName: claim.Status.NodeName,
+			}
+			if err := prov.DeprovisionMachine(ctx, machine); err != nil {
+				logger.Error(err, "failed to deprovision machine while recycling", "providerID", claim.Status.ProviderID)
+				r.Recorder.Eventf(claim, corev1.EventTypeWarning, "DeprovisioningFailed",
+					"Failed to deprovision machine %s during recycle: %v", claim.Status.ProviderID, err)
+			} else {
+				logger.Info("machine deprovisioned while recycling", "providerID", claim.Status.ProviderID)
+				r.Recorder.Eventf(claim, corev1.EventTypeNormal, "MachineDeprovisioned",
+					"Machine %s deprovisioned during recycle", claim.Status.ProviderID)
+			}
+		}
+	}
+
+	nextAttempts := claim.Status.LaunchAttempts + 1
+	maxReached := nextAttempts >= maxLaunchAttempts
+
+	if err := r.updateStatus(ctx, claim, func(updated *kubenodesmithv1alpha1.NodeSmithClaim) {
+		updated.Status.ProviderID = ""
+		updated.Status.NodeName = ""
+		updated.Status.LaunchAttempts = nextAttempts
+
+		meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
+			Type:               kubenodesmithv1alpha1.ConditionTypeLaunched,
+			Status:             metav1.ConditionFalse,
+			Reason:             "RecycleNotReady",
+			Message:            message,
+			ObservedGeneration: updated.Generation,
+		})
+		meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
+			Type:               kubenodesmithv1alpha1.ConditionTypeRegistered,
+			Status:             metav1.ConditionFalse,
+			Reason:             "RecycleNotReady",
+			Message:            message,
+			ObservedGeneration: updated.Generation,
+		})
+		meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
+			Type:               kubenodesmithv1alpha1.ConditionTypeInitialized,
+			Status:             metav1.ConditionFalse,
+			Reason:             "RecycleNotReady",
+			Message:            message,
+			ObservedGeneration: updated.Generation,
+		})
+		meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
+			Type:               kubenodesmithv1alpha1.ConditionTypeReady,
+			Status:             metav1.ConditionFalse,
+			Reason:             "RecycleNotReady",
+			Message:            message,
+			ObservedGeneration: updated.Generation,
+		})
+
+		if maxReached {
+			meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
+				Type:               kubenodesmithv1alpha1.ConditionTypeFailed,
+				Status:             metav1.ConditionTrue,
+				Reason:             "RecycleNotReady",
+				Message:            fmt.Sprintf("%s; maximum launch attempts reached (%d)", message, maxLaunchAttempts),
+				ObservedGeneration: updated.Generation,
+			})
+		} else {
+			meta.RemoveStatusCondition(&updated.Status.Conditions, kubenodesmithv1alpha1.ConditionTypeFailed)
+		}
+	}); err != nil {
+		logger.Error(err, "failed to update status while recycling")
+		return &ctrl.Result{}, err
+	}
+
+	if maxReached {
+		logger.Info("maximum launch attempts reached while recycling; marking claim failed")
+		return &ctrl.Result{}, nil
+	}
+
+	logger.Info("recycled claim; will relaunch")
+	r.Recorder.Eventf(claim, corev1.EventTypeWarning, "RecycleNotReady", message)
+	return &ctrl.Result{RequeueAfter: immediateRequeueDelay}, nil
 }
 
 // nodeMatchesClaim attempts to match a node to a claim using heuristics.
