@@ -152,6 +152,12 @@ spec:
                   lease tracks long-running operations that need coordination (e.g. provisioning, draining).
                   Controllers use this lease to coordinate work and recover from crashes by treating expired leases as abandoned.
                 properties:
+                  heartbeatTTLSeconds:
+                    description: |-
+                      heartbeatTTLSeconds defines how long a lease is valid after the last heartbeat.
+                      If the holder crashes, the lease expires after this duration.
+                    format: int32
+                    type: integer
                   holder:
                     description: holder identifies the controller instance currently
                       holding the lease.

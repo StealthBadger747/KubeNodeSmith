@@ -232,7 +232,7 @@ func (r *ControlPlaneReconciler) ensureProvider(ctx context.Context, providerTyp
 		return nil, fmt.Errorf("unsupported provider type %q", providerObj.Spec.Type)
 	}
 
-	providerInstance, err := builder(ctx, providerObj)
+	providerInstance, err := builder(ctx, r.Client, providerObj)
 	if err != nil {
 		return nil, err
 	}
