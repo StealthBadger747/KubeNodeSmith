@@ -10,6 +10,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	clientrecord "k8s.io/client-go/tools/record"
@@ -177,7 +178,7 @@ func TestReconcileRegistrationRetriesAfterTimeout(t *testing.T) {
 		Scheme:   scheme,
 		Recorder: clientrecord.NewFakeRecorder(10),
 		ProviderFactories: map[string]ProviderBuilder{
-			"proxmox": func(ctx context.Context, providerObj *kubenodesmithv1alpha1.NodeSmithProvider) (provider.Provider, error) {
+			"proxmox": func(ctx context.Context, c ctrlclient.Client, providerObj *kubenodesmithv1alpha1.NodeSmithProvider) (provider.Provider, error) {
 				return stub, nil
 			},
 		},
@@ -289,7 +290,7 @@ func TestReconcileRegistrationMarksFailedAfterMaxAttempts(t *testing.T) {
 		Scheme:   scheme,
 		Recorder: clientrecord.NewFakeRecorder(10),
 		ProviderFactories: map[string]ProviderBuilder{
-			"proxmox": func(ctx context.Context, providerObj *kubenodesmithv1alpha1.NodeSmithProvider) (provider.Provider, error) {
+			"proxmox": func(ctx context.Context, c ctrlclient.Client, providerObj *kubenodesmithv1alpha1.NodeSmithProvider) (provider.Provider, error) {
 				return stub, nil
 			},
 		},

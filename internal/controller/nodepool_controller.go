@@ -13,11 +13,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/uuid"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -73,29 +71,22 @@ type NodePoolReconciler struct {
 // move the current state of the cluster closer to the desired state.
 func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := logf.FromContext(ctx).WithValues("nodesmithpool", req.NamespacedName)
-	var cs = kubernetes.NewForConfigOrDie(ctrl.GetConfigOrDie())
 
 	// High-level reconciliation outline:
 	// 1. Fetch the NodeSmithPool; return gracefully if it no longer exists.
-	// 2. Capture a logger scoped to the pool and stash a deep copy of the original status.
-	// 3. If deletion timestamp is set, ensure finalizers run: drain provider-owned machines,
-	//    delete or release NodeSmithClaims, update status, then remove the finalizer.
-	// 4. Validate spec invariants (providerRef present, limits sane, scale policies valid) and
-	//    surface configuration errors via status conditions.
-	// 5. Resolve the referenced NodeSmithProvider, initializing the concrete provider client and
-	//    failing early if credentials/options are missing.
-	// 6. List NodeSmithClaims tied to this pool and correlate them with provider machines and
-	//    registered Kubernetes nodes to understand actual capacity.
-	// 7. Determine desired capacity using min/max limits, outstanding claims, and scale-up/down
-	//    policies (batch size, stabilization windows, drain concurrency, etc.).
-	// 8. Handle scale-up by creating new NodeSmithClaims and, when ready, issuing ProvisionMachine
-	//    calls with appropriate MachineSpec derived from the pool template and limits.
-	// 9. Handle scale-down by picking surplus machines, coordinating node cordon/drain, updating
-	//    the corresponding claims, and calling DeprovisionMachine respecting drain timeouts.
-	// 10. Ensure machines/nodes carry the pool label key, template labels, taints, and other
-	//     desired metadata; detect drift and record conditions/events.
-	// 11. Update status (ObservedGeneration, Conditions, LastScaleActivity, counts) and emit
-	//     events; decide whether to requeue immediately or after backoff based on ongoing work.
+	// 2. Handle deletion: if deletion timestamp is set, finalize the pool (delete all claims).
+	// 3. Ensure finalizer is present on the pool.
+	// 4. Calculate cluster state:
+	//    - List unschedulable pods to determine demand.
+	//    - List existing nodes in this pool to determine current capacity.
+	// 5. Scale Up:
+	//    - If there are unschedulable pods, calculate how many new nodes are needed.
+	//    - Create new NodeSmithClaim resources to request new machines.
+	//    - (The NodeClaimReconciler will handle the actual provisioning).
+	// 6. Scale Down:
+	//    - If no unschedulable pods and node count > minNodes, identify candidates for removal.
+	//    - Delete NodeSmithClaim resources for nodes to be removed.
+	//    - (The NodeClaimReconciler will handle cordon/drain and deprovisioning).
 
 	var nodePool kubenodesmithv1alpha1.NodeSmithPool
 	if err := r.Get(ctx, req.NamespacedName, &nodePool); err != nil {
@@ -119,26 +110,26 @@ func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 	}
 
-	unschedulablePods, err := kube.GetUnschedulablePods(ctx, cs)
+	unschedulablePods, err := kube.GetUnschedulablePods(ctx, r.Client)
 	if err != nil {
 		logger.Error(err, "list unschedulable pods")
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 
-	nodesInPool, err := kube.GetNodesByLabel(ctx, cs, nodePool.Spec.PoolLabelKey, nodePool.Name)
+	nodesInPool, err := kube.GetNodesByLabel(ctx, r.Client, nodePool.Spec.PoolLabelKey, nodePool.Name)
 	if err != nil {
 		logger.Error(err, "failed to list nodes in pool", "pool", nodePool.Name)
 	}
 
 	if len(unschedulablePods) != 0 {
 		// Scale up to accommodate unschedulable pods
-		result, err := r.reconcileScaleUp(ctx, &nodePool, cs, unschedulablePods, nodesInPool)
+		result, err := r.reconcileScaleUp(ctx, &nodePool, unschedulablePods, nodesInPool)
 		if err != nil || result.RequeueAfter > 0 {
 			return result, err
 		}
 	} else if len(nodesInPool) > nodePool.Spec.Limits.MinNodes {
 		// No unschedulable pods and we're above min nodes - consider scale down
-		result, err := r.reconcileScaleDown(ctx, &nodePool, cs, nodesInPool)
+		result, err := r.reconcileScaleDown(ctx, &nodePool, nodesInPool)
 		if err != nil || result.RequeueAfter > 0 {
 			return result, err
 		}
@@ -151,7 +142,6 @@ func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 func (r *NodePoolReconciler) reconcileScaleDown(
 	ctx context.Context,
 	nodePool *kubenodesmithv1alpha1.NodeSmithPool,
-	cs *kubernetes.Clientset,
 	nodesInPool []corev1.Node,
 ) (ctrl.Result, error) {
 	logger := logf.FromContext(ctx).WithValues("pool", nodePool.Name)
@@ -164,7 +154,7 @@ func (r *NodePoolReconciler) reconcileScaleDown(
 		return ctrl.Result{}, nil
 	}
 
-	nodes, err := kube.GetScaleDownCandidates(ctx, cs, nodePool)
+	nodes, err := kube.GetScaleDownCandidates(ctx, r.Client, nodePool)
 	if err != nil {
 		logger.Error(err, "get scale down candidates")
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
@@ -254,7 +244,6 @@ func (r *NodePoolReconciler) reconcileScaleDown(
 func (r *NodePoolReconciler) reconcileScaleUp(
 	ctx context.Context,
 	nodePool *kubenodesmithv1alpha1.NodeSmithPool,
-	cs *kubernetes.Clientset,
 	unschedulablePods []corev1.Pod,
 	nodesInPool []corev1.Node,
 ) (ctrl.Result, error) {
@@ -278,7 +267,7 @@ func (r *NodePoolReconciler) reconcileScaleUp(
 		return ctrl.Result{}, nil
 	}
 
-	nodeBuckets, err := buildNodeBuckets(ctx, cs, nodesInPool)
+	nodeBuckets, err := buildNodeBuckets(ctx, r.Client, nodesInPool)
 	if err != nil {
 		logger.Error(err, "failed to compute node capacity")
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
@@ -299,7 +288,7 @@ func (r *NodePoolReconciler) reconcileScaleUp(
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 
-	poolUsage, err := kube.GetPoolResourceUsage(ctx, cs, nodePool)
+	poolUsage, err := kube.GetPoolResourceUsage(ctx, r.Client, nodePool)
 	if err != nil {
 		logger.Error(err, "get pool resource usage")
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
@@ -601,7 +590,7 @@ func determineNodeCapacity(nodes []corev1.Node, claims *kubenodesmithv1alpha1.No
 	return fallback
 }
 
-func buildNodeBuckets(ctx context.Context, cs *kubernetes.Clientset, nodes []corev1.Node) ([]capacityBucket, error) {
+func buildNodeBuckets(ctx context.Context, c client.Client, nodes []corev1.Node) ([]capacityBucket, error) {
 	buckets := make([]capacityBucket, 0, len(nodes))
 	for _, node := range nodes {
 		allocCPU := int64(0)
@@ -612,7 +601,7 @@ func buildNodeBuckets(ctx context.Context, cs *kubernetes.Clientset, nodes []cor
 		if v := node.Status.Allocatable.Memory(); v != nil {
 			allocMem = v.Value()
 		}
-		pods, err := listPodsOnNode(ctx, cs, node.Name)
+		pods, err := listPodsOnNode(ctx, c, node.Name)
 		if err != nil {
 			return nil, err
 		}
@@ -703,15 +692,19 @@ func planCapacity(pods []corev1.Pod, buckets []capacityBucket, template nodeCapa
 	return newClaims
 }
 
-func listPodsOnNode(ctx context.Context, cs *kubernetes.Clientset, nodeName string) ([]corev1.Pod, error) {
-	list, err := cs.CoreV1().Pods("").List(ctx, metav1.ListOptions{
-		FieldSelector: fields.OneTermEqualSelector("spec.nodeName", nodeName).String(),
-	})
-	if err != nil {
-		return nil, err
+func listPodsOnNode(ctx context.Context, c client.Client, nodeName string) ([]corev1.Pod, error) {
+	var podList corev1.PodList
+	if err := c.List(ctx, &podList, client.MatchingFields{"spec.nodeName": nodeName}); err != nil {
+		// Fallback: list all and filter
+		if err := c.List(ctx, &podList); err != nil {
+			return nil, err
+		}
 	}
-	result := make([]corev1.Pod, 0, len(list.Items))
-	for _, pod := range list.Items {
+	result := make([]corev1.Pod, 0, len(podList.Items))
+	for _, pod := range podList.Items {
+		if pod.Spec.NodeName != nodeName {
+			continue
+		}
 		if _, ok := pod.Annotations["kubernetes.io/config.mirror"]; ok {
 			continue
 		}

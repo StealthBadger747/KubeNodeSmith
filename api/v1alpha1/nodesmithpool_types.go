@@ -16,6 +16,8 @@ type NodeSmithPoolSpec struct {
 	MachineTemplate MachineTemplate  `json:"machineTemplate"`
 	ScaleUp         *ScaleUpPolicy   `json:"scaleUp,omitempty"`
 	ScaleDown       *ScaleDownPolicy `json:"scaleDown,omitempty"`
+	// +optional
+	RegistrationTimeout *metav1.Duration `json:"registrationTimeout,omitempty"`
 }
 
 // NodePoolLimits constrains pool size and aggregate resources.

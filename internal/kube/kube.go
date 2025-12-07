@@ -2,119 +2,15 @@ package kube
 
 import (
 	"context"
-	"flag"
 	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
-	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/util/homedir"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kubenodesmithv1alpha1 "github.com/StealthBadger747/KubeNodeSmith/api/v1alpha1"
 )
-
-const kubeconfigFlag = "kubeconfig"
-
-var (
-	kubeconfigPath string
-	restOnce       sync.Once
-	restConfig     *rest.Config
-	restErr        error
-)
-
-func init() {
-	defaultPath := ""
-	if home := homedir.HomeDir(); home != "" {
-		defaultPath = filepath.Join(home, ".kube", "config")
-	}
-	kubeconfigPath = defaultPath
-
-	if flag.Lookup(kubeconfigFlag) == nil {
-		flag.StringVar(&kubeconfigPath, kubeconfigFlag, defaultPath, "(optional) absolute path to the kubeconfig file")
-	}
-}
-
-func tryExplicitKubeconfig() (*rest.Config, error) {
-	path := getKubeconfigPath()
-	if path == "" {
-		return nil, fmt.Errorf("kubeconfig path not set")
-	}
-	if _, err := os.Stat(path); err != nil {
-		return nil, err
-	}
-	return clientcmd.BuildConfigFromFlags("", path)
-}
-
-func getKubeconfigPath() string {
-	if f := flag.Lookup(kubeconfigFlag); f != nil {
-		value := strings.TrimSpace(f.Value.String())
-		if value != "" {
-			return value
-		}
-	}
-	return kubeconfigPath
-}
-
-func loadRESTConfig() {
-	sources := []func() (*rest.Config, error){
-		tryExplicitKubeconfig,
-		rest.InClusterConfig,
-		func() (*rest.Config, error) {
-			return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-				clientcmd.NewDefaultClientConfigLoadingRules(),
-				&clientcmd.ConfigOverrides{},
-			).ClientConfig()
-		},
-	}
-
-	for _, src := range sources {
-		cfg, err := src()
-		if err != nil {
-			restErr = err
-			continue
-		}
-		restConfig = cfg
-		restErr = nil
-		return
-	}
-}
-
-// GetRESTConfig returns a shared REST config derived from in-cluster or kubeconfig settings.
-func GetRESTConfig() (*rest.Config, error) {
-	restOnce.Do(loadRESTConfig)
-	if restErr != nil {
-		return nil, restErr
-	}
-	return restConfig, nil
-}
-
-// GetClientset returns a typed Kubernetes clientset using the shared REST config.
-func GetClientset() (*kubernetes.Clientset, error) {
-	cfg, err := GetRESTConfig()
-	if err != nil {
-		return nil, err
-	}
-	return kubernetes.NewForConfig(cfg)
-}
-
-// GetDynamicClient returns a dynamic client using the shared REST config.
-func GetDynamicClient() (dynamic.Interface, error) {
-	cfg, err := GetRESTConfig()
-	if err != nil {
-		return nil, err
-	}
-	return dynamic.NewForConfig(cfg)
-}
 
 func PrintNodes(nodes []corev1.Node) {
 	fmt.Printf("Total Candidate Nodes: %d\n", len(nodes))
@@ -150,36 +46,23 @@ func toleratesUnschedulable(pod *corev1.Pod) bool {
 	return false
 }
 
-func GetNodesByLabel(ctx context.Context, clientset *kubernetes.Clientset, labelKey string, labelValue string) ([]corev1.Node, error) {
-	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{
-		LabelSelector: fields.OneTermEqualSelector(labelKey, labelValue).String(),
-	})
-	if err != nil {
+func GetNodesByLabel(ctx context.Context, c client.Client, labelKey string, labelValue string) ([]corev1.Node, error) {
+	var nodeList corev1.NodeList
+	if err := c.List(ctx, &nodeList, client.MatchingLabels{labelKey: labelValue}); err != nil {
 		return nil, err
 	}
-
-	return nodes.Items, nil
+	return nodeList.Items, nil
 }
 
-func CordonNode(ctx context.Context, clientset *kubernetes.Clientset, nodeName string) error {
-	node, err := clientset.CoreV1().Nodes().Get(
-		ctx,
-		nodeName,
-		metav1.GetOptions{},
-	)
-	if err != nil {
+func CordonNode(ctx context.Context, c client.Client, nodeName string) error {
+	var node corev1.Node
+	if err := c.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
 		return err
 	}
 
+	patch := client.MergeFrom(node.DeepCopy())
 	node.Spec.Unschedulable = true
-
-	_, err = clientset.CoreV1().Nodes().Update(
-		ctx,
-		node,
-		metav1.UpdateOptions{},
-	)
-
-	return err
+	return c.Patch(ctx, &node, patch)
 }
 
 func PrintPods(pods []corev1.Pod) {
@@ -207,18 +90,17 @@ func isUnschedulable(condition corev1.PodCondition) bool {
 	return condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse && condition.Reason == corev1.PodReasonUnschedulable
 }
 
-func GetUnschedulablePods(ctx context.Context, clientset *kubernetes.Clientset) ([]corev1.Pod, error) {
-	podList, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{
-		FieldSelector: fields.AndSelectors(
-			fields.OneTermEqualSelector("spec.nodeName", ""),
-		).String(),
-	})
-	if err != nil {
+func GetUnschedulablePods(ctx context.Context, c client.Client) ([]corev1.Pod, error) {
+	var podList corev1.PodList
+	if err := c.List(ctx, &podList); err != nil {
 		return nil, err
 	}
 
 	out := make([]corev1.Pod, 0, len(podList.Items))
 	for _, pod := range podList.Items {
+		if pod.Spec.NodeName != "" {
+			continue
+		}
 		if pod.Status.Phase != corev1.PodPending {
 			continue
 		}
@@ -228,28 +110,27 @@ func GetUnschedulablePods(ctx context.Context, clientset *kubernetes.Clientset) 
 		for _, condition := range pod.Status.Conditions {
 			if isUnschedulable(condition) {
 				out = append(out, pod)
+				break
 			}
 		}
-
 	}
 
 	return out, nil
 }
 
-func LastFailedSchedulingEvent(ctx context.Context, cs *kubernetes.Clientset, p *corev1.Pod) (string, error) {
-	el, err := cs.CoreV1().Events(p.Namespace).List(ctx, metav1.ListOptions{
-		FieldSelector: fields.AndSelectors(
-			fields.OneTermEqualSelector("involvedObject.kind", "Pod"),
-			fields.OneTermEqualSelector("involvedObject.name", p.Name),
-			fields.OneTermEqualSelector("type", "Warning"),
-		).String(),
-	})
-	if err != nil {
+func LastFailedSchedulingEvent(ctx context.Context, c client.Client, p *corev1.Pod) (string, error) {
+	var eventList corev1.EventList
+	if err := c.List(ctx, &eventList, client.InNamespace(p.Namespace), client.MatchingFields{
+		"involvedObject.kind": "Pod",
+		"involvedObject.name": p.Name,
+		"type":                "Warning",
+	}); err != nil {
 		return "", err
 	}
+
 	var msg string
 	var newest time.Time
-	for _, e := range el.Items {
+	for _, e := range eventList.Items {
 		if e.Reason != "FailedScheduling" {
 			continue
 		}
@@ -270,16 +151,20 @@ func LastFailedSchedulingEvent(ctx context.Context, cs *kubernetes.Clientset, p 
 	return msg, nil
 }
 
-func GetEvictablePods(ctx context.Context, clientset *kubernetes.Clientset, nodeName string) ([]corev1.Pod, error) {
-	podList, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{
-		FieldSelector: fields.OneTermEqualSelector("spec.nodeName", nodeName).String(),
-	})
-	if err != nil {
-		return nil, err
+func GetEvictablePods(ctx context.Context, c client.Client, nodeName string) ([]corev1.Pod, error) {
+	var podList corev1.PodList
+	if err := c.List(ctx, &podList, client.MatchingFields{"spec.nodeName": nodeName}); err != nil {
+		// Fallback: list all and filter
+		if err := c.List(ctx, &podList); err != nil {
+			return nil, err
+		}
 	}
 
 	out := make([]corev1.Pod, 0, len(podList.Items))
 	for _, p := range podList.Items {
+		if p.Spec.NodeName != nodeName {
+			continue
+		}
 		// Skip mirror pods (static pods)
 		if _, ok := p.Annotations["kubernetes.io/config.mirror"]; ok {
 			continue
@@ -351,15 +236,25 @@ type PoolResourceUsage struct {
 }
 
 // GetPoolResourceUsage calculates the current resource utilization of a node pool
-// Based on Kubernetes allocatable resources (what's available for pod scheduling)
-// and pod resource requests (what pods have requested)
-func GetPoolResourceUsage(ctx context.Context, clientset *kubernetes.Clientset, nodePool *kubenodesmithv1alpha1.NodeSmithPool) (*PoolResourceUsage, error) {
+func GetPoolResourceUsage(ctx context.Context, c client.Client, nodePool *kubenodesmithv1alpha1.NodeSmithPool) (*PoolResourceUsage, error) {
 	nodepoolKey := nodePool.Spec.PoolLabelKey
 	nodepoolValue := nodePool.Name
 
-	nodes, err := GetNodesByLabel(ctx, clientset, nodepoolKey, nodepoolValue)
+	nodes, err := GetNodesByLabel(ctx, c, nodepoolKey, nodepoolValue)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get nodes in pool: %w", err)
+	}
+
+	var allPods corev1.PodList
+	if err := c.List(ctx, &allPods); err != nil {
+		return nil, fmt.Errorf("failed to list pods: %w", err)
+	}
+
+	podsByNode := make(map[string][]corev1.Pod)
+	for _, pod := range allPods.Items {
+		if pod.Spec.NodeName != "" {
+			podsByNode[pod.Spec.NodeName] = append(podsByNode[pod.Spec.NodeName], pod)
+		}
 	}
 
 	var allocatableCPUMilli int64
@@ -369,18 +264,14 @@ func GetPoolResourceUsage(ctx context.Context, clientset *kubernetes.Clientset, 
 	var allocatedCPUMilli int64
 	var allocatedMemBytes int64
 
-	// Calculate total node capacity and allocated resources
 	for _, node := range nodes {
-		// Get node allocatable resources (what's actually available for pod scheduling)
-		// This is Capacity minus system reservations (kubelet, system daemons, etc.)
+		// Node capacity/allocatable
 		if cpu := node.Status.Allocatable.Cpu(); cpu != nil {
 			allocatableCPUMilli += cpu.MilliValue()
 		}
 		if mem := node.Status.Allocatable.Memory(); mem != nil {
 			allocatableMemBytes += mem.Value()
 		}
-
-		// Get total system capacity (for limit checking)
 		if cpu := node.Status.Capacity.Cpu(); cpu != nil {
 			totalCPUMilli += cpu.MilliValue()
 		}
@@ -388,33 +279,33 @@ func GetPoolResourceUsage(ctx context.Context, clientset *kubernetes.Clientset, 
 			totalMemBytes += mem.Value()
 		}
 
-		// Get all pods on this node (including DaemonSets, critical pods, etc.)
-		pods, err := getAllPodsOnNode(ctx, clientset, node.Name)
-		if err != nil {
-			// If we can't get pods for a node, skip it but continue with others
-			fmt.Printf("Warning: failed to get pods for node %s: %v\n", node.Name, err)
-			continue
-		}
+		// Pod usage for this node (lookup from map)
+		if nodePods, ok := podsByNode[node.Name]; ok {
+			for _, pod := range nodePods {
+				// Skip mirror pods, terminal pods, deleted pods
+				if _, ok := pod.Annotations["kubernetes.io/config.mirror"]; ok {
+					continue
+				}
+				if pod.DeletionTimestamp != nil {
+					continue
+				}
+				if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+					continue
+				}
 
-		// Calculate allocated resources for this node
-		for _, pod := range pods {
-			cpuMilli, memBytes := GetRequestedResources(&pod)
-			allocatedCPUMilli += cpuMilli
-			allocatedMemBytes += memBytes
+				cpuMilli, memBytes := GetRequestedResources(&pod)
+				allocatedCPUMilli += cpuMilli
+				allocatedMemBytes += memBytes
+			}
 		}
 	}
 
-	// Calculate available resources (based on allocatable, not total)
 	availableCPUMilli := allocatableCPUMilli - allocatedCPUMilli
 	availableMemBytes := allocatableMemBytes - allocatedMemBytes
 
-	// For now, used resources are the same as allocated (we could enhance this later to track actual usage)
-	usedCPUMilli := allocatedCPUMilli
-	usedMemBytes := allocatedMemBytes
-
 	return &PoolResourceUsage{
-		UsedCPUMilli:           usedCPUMilli,
-		UsedMemoryBytes:        usedMemBytes,
+		UsedCPUMilli:           allocatedCPUMilli,
+		UsedMemoryBytes:        allocatedMemBytes,
 		AllocatedCPUMilli:      allocatedCPUMilli,
 		AllocatedMemoryBytes:   allocatedMemBytes,
 		AvailableCPUMilli:      availableCPUMilli,
@@ -427,42 +318,11 @@ func GetPoolResourceUsage(ctx context.Context, clientset *kubernetes.Clientset, 
 	}, nil
 }
 
-// getAllPodsOnNode gets all pods running on a specific node that consume resources
-func getAllPodsOnNode(ctx context.Context, clientset *kubernetes.Clientset, nodeName string) ([]corev1.Pod, error) {
-	podList, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{
-		FieldSelector: fields.OneTermEqualSelector("spec.nodeName", nodeName).String(),
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	pods := make([]corev1.Pod, 0, len(podList.Items))
-	for _, pod := range podList.Items {
-		// Skip mirror pods (static pods) - they don't consume resources
-		if _, ok := pod.Annotations["kubernetes.io/config.mirror"]; ok {
-			continue
-		}
-		// Skip pods that are already being deleted - they're not consuming resources
-		if pod.DeletionTimestamp != nil {
-			continue
-		}
-		// Skip terminal pods (Succeeded/Failed) - they're not consuming resources
-		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
-			continue
-		}
-
-		// Include all other pods (DaemonSets, regular pods, critical pods, etc.)
-		pods = append(pods, pod)
-	}
-
-	return pods, nil
-}
-
-func GetScaleDownCandidates(ctx context.Context, clientset *kubernetes.Clientset, nodePool *kubenodesmithv1alpha1.NodeSmithPool) ([]corev1.Node, error) {
+func GetScaleDownCandidates(ctx context.Context, c client.Client, nodePool *kubenodesmithv1alpha1.NodeSmithPool) ([]corev1.Node, error) {
 	nodepoolKey := nodePool.Spec.PoolLabelKey
 	nodepoolValue := nodePool.Name
 
-	nodes, err := GetNodesByLabel(ctx, clientset, nodepoolKey, nodepoolValue)
+	nodes, err := GetNodesByLabel(ctx, c, nodepoolKey, nodepoolValue)
 	if err != nil {
 		return nil, err
 	}
@@ -473,7 +333,7 @@ func GetScaleDownCandidates(ctx context.Context, clientset *kubernetes.Clientset
 		if node.Spec.Unschedulable {
 			continue
 		}
-		evictablePods, err := GetEvictablePods(ctx, clientset, node.Name)
+		evictablePods, err := GetEvictablePods(ctx, c, node.Name)
 		if err != nil {
 			return nil, fmt.Errorf("get evictable pods for node %s: %w", node.Name, err)
 		}
@@ -487,29 +347,28 @@ func GetScaleDownCandidates(ctx context.Context, clientset *kubernetes.Clientset
 	return candidates, nil
 }
 
-func LabelNode(ctx context.Context, clientset *kubernetes.Clientset, nodeName string, labels map[string]string) error {
-	node, err := clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
-	if err != nil {
+func LabelNode(ctx context.Context, c client.Client, nodeName string, labels map[string]string) error {
+	var node corev1.Node
+	if err := c.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
 		return err
 	}
 
+	patch := client.MergeFrom(node.DeepCopy())
 	if node.Labels == nil {
 		node.Labels = make(map[string]string)
 	}
-
 	for key, value := range labels {
 		node.Labels[key] = value
 	}
 
-	_, err = clientset.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
-	return err
+	return c.Patch(ctx, &node, patch)
 }
 
-func WaitForNodeReady(ctx context.Context, clientset *kubernetes.Clientset, nodeName string, timeout time.Duration) error {
+func WaitForNodeReady(ctx context.Context, c client.Client, nodeName string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -517,26 +376,19 @@ func WaitForNodeReady(ctx context.Context, clientset *kubernetes.Clientset, node
 		case <-ctx.Done():
 			return fmt.Errorf("timeout waiting for node %s to be ready", nodeName)
 		case <-ticker.C:
-			node, err := clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
-			if err != nil {
-				// If node is not found, continue waiting - it might not be registered yet
+			var node corev1.Node
+			if err := c.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
 				if errors.IsNotFound(err) {
-					fmt.Printf("Node %s not found yet, continuing to wait...\n", nodeName)
 					continue
 				}
-				// For other errors, return immediately
-				return fmt.Errorf("error getting node %s: %v", nodeName, err)
+				return fmt.Errorf("error getting node %s: %w", nodeName, err)
 			}
 
-			// Check if node is ready
 			for _, condition := range node.Status.Conditions {
 				if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
-					fmt.Printf("Node %s is now ready!\n", nodeName)
 					return nil
 				}
 			}
-
-			fmt.Printf("Node %s exists but not ready yet, continuing to wait...\n", nodeName)
 		}
 	}
 }

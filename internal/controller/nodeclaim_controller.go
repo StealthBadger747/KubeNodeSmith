@@ -330,7 +330,6 @@ func (r *NodeClaimReconciler) reconcileRegistration(ctx context.Context, claim *
 	}
 
 	// Look for node with matching providerID
-	// NOTE: For now using hostname matching since you haven't implemented providerID in cloud-init yet
 	// TODO: Switch to providerID matching when ready
 
 	var nodes corev1.NodeList
@@ -340,7 +339,6 @@ func (r *NodeClaimReconciler) reconcileRegistration(ctx context.Context, claim *
 	}
 
 	// Try to find the node (using name matching for now)
-	// In production, use: node.Spec.ProviderID == claim.Status.ProviderID
 	expectedNodeName := claim.Name // TODO: Change to providerID matching when ready
 	for i := range nodes.Items {
 		node := &nodes.Items[i]
@@ -397,10 +395,16 @@ func (r *NodeClaimReconciler) reconcileRegistration(ctx context.Context, claim *
 	// Node not found yet - check timeout
 	launchedCond := meta.FindStatusCondition(claim.Status.Conditions, kubenodesmithv1alpha1.ConditionTypeLaunched)
 	if launchedCond != nil {
+		// Check for configurable timeout from pool
+		timeout := registrationTimeout
+		if pool, err := r.getPoolForClaim(ctx, claim); err == nil && pool.Spec.RegistrationTimeout != nil {
+			timeout = pool.Spec.RegistrationTimeout.Duration
+		}
+
 		timeSinceLaunch := time.Since(launchedCond.LastTransitionTime.Time)
-		if timeSinceLaunch > registrationTimeout {
+		if timeSinceLaunch > timeout {
 			// Timeout! Fail the claim and deprovision the machine
-			logger.Info("registration timeout exceeded", "elapsed", timeSinceLaunch)
+			logger.Info("registration timeout exceeded", "elapsed", timeSinceLaunch, "timeout", timeout)
 
 			// Deprovision the machine
 			prov, err := r.getProviderForClaim(ctx, claim)
@@ -430,9 +434,9 @@ func (r *NodeClaimReconciler) reconcileRegistration(ctx context.Context, claim *
 			maxAttemptsReached := attempts >= maxLaunchAttempts
 			var registeredMessage string
 			if maxAttemptsReached {
-				registeredMessage = fmt.Sprintf("Node did not register within %v after %d attempts; giving up", registrationTimeout, attempts)
+				registeredMessage = fmt.Sprintf("Node did not register within %v after %d attempts; giving up", timeout, attempts)
 			} else {
-				registeredMessage = fmt.Sprintf("Node did not register within %v (attempt %d/%d); retrying", registrationTimeout, attempts, maxLaunchAttempts)
+				registeredMessage = fmt.Sprintf("Node did not register within %v (attempt %d/%d); retrying", timeout, attempts, maxLaunchAttempts)
 			}
 
 			if err := r.updateStatus(ctx, claim, func(updated *kubenodesmithv1alpha1.NodeSmithClaim) {
@@ -477,17 +481,17 @@ func (r *NodeClaimReconciler) reconcileRegistration(ctx context.Context, claim *
 
 			if maxAttemptsReached {
 				r.Recorder.Eventf(claim, corev1.EventTypeWarning, "RegistrationFailed",
-					"Node did not register within %v after %d attempts; giving up", registrationTimeout, attempts)
+					"Node did not register within %v after %d attempts; giving up", timeout, attempts)
 				return &ctrl.Result{}, nil
 			}
 
 			r.Recorder.Eventf(claim, corev1.EventTypeWarning, "RegistrationTimeout",
-				"Node did not register within %v (attempt %d/%d); retrying", registrationTimeout, attempts, maxLaunchAttempts)
+				"Node did not register within %v (attempt %d/%d); retrying", timeout, attempts, maxLaunchAttempts)
 
 			return &ctrl.Result{RequeueAfter: immediateRequeueDelay}, nil
 		}
 
-		logger.V(1).Info("waiting for node to register", "elapsed", timeSinceLaunch, "timeout", registrationTimeout)
+		logger.V(1).Info("waiting for node to register", "elapsed", timeSinceLaunch, "timeout", timeout)
 	}
 
 	// Still waiting - requeue
@@ -847,10 +851,26 @@ func (r *NodeClaimReconciler) getLeaseHolderID() string {
 }
 
 func leaseExpired(lease *kubenodesmithv1alpha1.NodeSmithClaimLease) bool {
-	if lease == nil || lease.TimeoutSeconds <= 0 {
+	if lease == nil {
 		return true
 	}
-	return time.Since(leaseReferenceTime(lease)) > time.Duration(lease.TimeoutSeconds)*time.Second
+	// Check heartbeat TTL (crashed worker detection)
+	if lease.HeartbeatTTLSeconds > 0 {
+		lastHeartbeat := lease.LastHeartbeat.Time
+		if lastHeartbeat.IsZero() {
+			lastHeartbeat = lease.Started.Time
+		}
+		if time.Since(lastHeartbeat) > time.Duration(lease.HeartbeatTTLSeconds)*time.Second {
+			return true
+		}
+	}
+	// Check total operation timeout (stuck operation detection)
+	if lease.TimeoutSeconds > 0 {
+		if time.Since(lease.Started.Time) > time.Duration(lease.TimeoutSeconds)*time.Second {
+			return true
+		}
+	}
+	return false
 }
 
 func leaseRemaining(lease *kubenodesmithv1alpha1.NodeSmithClaimLease) time.Duration {
@@ -883,11 +903,12 @@ func (r *NodeClaimReconciler) acquireLease(
 	}
 	if err := r.updateStatus(ctx, claim, func(updated *kubenodesmithv1alpha1.NodeSmithClaim) {
 		updated.Status.Lease = &kubenodesmithv1alpha1.NodeSmithClaimLease{
-			Holder:         holder,
-			Phase:          phase,
-			Started:        now,
-			LastHeartbeat:  now,
-			TimeoutSeconds: seconds,
+			Holder:              holder,
+			Phase:               phase,
+			Started:             now,
+			LastHeartbeat:       now,
+			TimeoutSeconds:      seconds,
+			HeartbeatTTLSeconds: 30,
 		}
 	}); err != nil {
 		return nil, err
@@ -976,7 +997,7 @@ func (r *NodeClaimReconciler) getProviderForClaim(ctx context.Context, claim *ku
 	}
 
 	// Build the provider instance
-	providerInstance, err := builder(ctx, &providerObj)
+	providerInstance, err := builder(ctx, r.Client, &providerObj)
 	if err != nil {
 		return nil, fmt.Errorf("initialize provider %s: %w", providerObj.Name, err)
 	}

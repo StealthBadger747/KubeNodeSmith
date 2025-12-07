@@ -116,6 +116,10 @@ type NodeSmithClaimLease struct {
 	// controllers consider it expired and attempt to recover the claim.
 	// +optional
 	TimeoutSeconds int32 `json:"timeoutSeconds,omitempty"`
+	// heartbeatTTLSeconds defines how long a lease is valid after the last heartbeat.
+	// If the holder crashes, the lease expires after this duration.
+	// +optional
+	HeartbeatTTLSeconds int32 `json:"heartbeatTTLSeconds,omitempty"`
 }
 
 // +kubebuilder:object:root=true

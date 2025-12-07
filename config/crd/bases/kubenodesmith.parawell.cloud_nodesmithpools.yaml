@@ -81,6 +81,8 @@ spec:
                 type: string
               providerRef:
                 type: string
+              registrationTimeout:
+                type: string
               scaleDown:
                 description: ScaleDownPolicy controls contraction behaviour.
                 properties:

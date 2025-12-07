@@ -12,12 +12,12 @@ import (
 	"strings"
 
 	kubenodesmithv1alpha1 "github.com/StealthBadger747/KubeNodeSmith/api/v1alpha1"
-	kube "github.com/StealthBadger747/KubeNodeSmith/internal/kube"
 	"github.com/StealthBadger747/KubeNodeSmith/internal/provider"
 	proxmoxapi "github.com/luthermonson/go-proxmox"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // Options captures provider-scoped configuration decoded from NodeSmithProvider resources.
@@ -126,7 +126,7 @@ func generateRandomMAC(prefix string) string {
 // NewProvider constructs a Proxmox-backed provider instance. It is expected to be called by the
 // autoscaler during startup. Secrets needed for authentication should already be resolved by the
 // caller and passed in via creds.
-func NewProvider(ctx context.Context, providerResource *kubenodesmithv1alpha1.NodeSmithProvider) (*Provider, error) {
+func NewProvider(ctx context.Context, c client.Client, providerResource *kubenodesmithv1alpha1.NodeSmithProvider) (*Provider, error) {
 	if providerResource == nil {
 		return nil, fmt.Errorf("provider resource is required")
 	}
@@ -136,7 +136,7 @@ func NewProvider(ctx context.Context, providerResource *kubenodesmithv1alpha1.No
 		return nil, fmt.Errorf("parse proxmox options: %w", err)
 	}
 
-	creds, err := loadCredentials(ctx, providerResource.Namespace, providerResource.Spec.CredentialsSecretRef)
+	creds, err := loadCredentials(ctx, c, providerResource.Namespace, providerResource.Spec.CredentialsSecretRef)
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +196,7 @@ func parseOptions(spec kubenodesmithv1alpha1.NodeSmithProviderSpec) (Options, er
 }
 
 // loadCredentials fetches and validates the credentials referenced by ref.
-func loadCredentials(ctx context.Context, defaultNamespace string, ref *corev1.SecretReference) (Credentials, error) {
+func loadCredentials(ctx context.Context, c client.Client, defaultNamespace string, ref *corev1.SecretReference) (Credentials, error) {
 	if ref == nil {
 		return Credentials{}, fmt.Errorf("credentialsSecretRef is required")
 	}
@@ -212,13 +212,8 @@ func loadCredentials(ctx context.Context, defaultNamespace string, ref *corev1.S
 		return Credentials{}, fmt.Errorf("credentialsSecretRef name is required")
 	}
 
-	clientset, err := kube.GetClientset()
-	if err != nil {
-		return Credentials{}, fmt.Errorf("create kubernetes client: %w", err)
-	}
-
-	secret, err := clientset.CoreV1().Secrets(namespace).Get(ctx, ref.Name, metav1.GetOptions{})
-	if err != nil {
+	var secret corev1.Secret
+	if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: ref.Name}, &secret); err != nil {
 		return Credentials{}, fmt.Errorf("fetch secret %s/%s: %w", namespace, ref.Name, err)
 	}
 
@@ -403,7 +398,7 @@ func (p *Provider) ProvisionMachine(ctx context.Context, spec provider.MachineSp
 			ProviderID:   fmt.Sprintf("proxmox://%s", spec.MachineName),
 			KubeNodeName: spec.MachineName,
 		}, nil
-	} else if err != nil && !errors.Is(err, errVMNotFound) {
+	} else if !errors.Is(err, errVMNotFound) {
 		return nil, fmt.Errorf("check existing vm: %w", err)
 	}
 
