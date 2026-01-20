@@ -130,6 +130,8 @@ func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		logger.Error(err, "failed to list nodes in pool", "pool", nodePool.Name)
 	}
 
+	r.refreshPoolStatus(ctx, &nodePool, cs)
+
 	if len(unschedulablePods) != 0 {
 		// Scale up to accommodate unschedulable pods
 		result, err := r.reconcileScaleUp(ctx, &nodePool, cs, unschedulablePods, nodesInPool)
@@ -787,6 +789,53 @@ func exceedsPoolLimits(
 	}
 
 	return false, ""
+}
+
+func (r *NodePoolReconciler) refreshPoolStatus(ctx context.Context, nodePool *kubenodesmithv1alpha1.NodeSmithPool, cs *kubernetes.Clientset) {
+	logger := logf.FromContext(ctx).WithValues("pool", nodePool.Name)
+
+	var claims kubenodesmithv1alpha1.NodeSmithClaimList
+	if err := r.List(ctx, &claims, client.InNamespace(nodePool.Namespace)); err != nil {
+		logger.Error(err, "list NodeSmithClaims for status check")
+		return
+	}
+
+	pendingCount, pendingCPUMilli, pendingMemBytes, err := countInflightClaims(nodePool, &claims)
+	if err != nil {
+		logger.Error(err, "count inflight claims for status check")
+		return
+	}
+
+	poolUsage, err := kube.GetPoolResourceUsage(ctx, cs, nodePool)
+	if err != nil {
+		logger.Error(err, "get pool resource usage for status check")
+		return
+	}
+
+	availableCond := metav1.Condition{
+		Type:               "Available",
+		Status:             metav1.ConditionTrue,
+		Reason:             "Available",
+		Message:            "Pool within limits",
+		ObservedGeneration: nodePool.Generation,
+	}
+
+	if nodePool.Spec.Limits.MaxNodes > 0 && poolUsage.NodeCount+pendingCount >= nodePool.Spec.Limits.MaxNodes {
+		msg := fmt.Sprintf("Pool at max capacity: %d/%d nodes (including %d pending)", poolUsage.NodeCount+pendingCount, nodePool.Spec.Limits.MaxNodes, pendingCount)
+		availableCond.Status = metav1.ConditionFalse
+		availableCond.Reason = "MaxNodesReached"
+		availableCond.Message = msg
+	} else if exceeded, reason := exceedsPoolLimits(poolUsage, &nodePool.Spec.Limits, pendingCPUMilli, pendingMemBytes, 0, 0); exceeded {
+		availableCond.Status = metav1.ConditionFalse
+		availableCond.Reason = "ResourceLimitReached"
+		availableCond.Message = reason
+	}
+
+	if updateErr := r.updateStatus(ctx, nodePool, func(p *kubenodesmithv1alpha1.NodeSmithPool) {
+		meta.SetStatusCondition(&p.Status.Conditions, availableCond)
+	}); updateErr != nil {
+		logger.Error(updateErr, "failed to update availability condition")
+	}
 }
 
 // finalizePool handles cleanup when a pool is deleted.
