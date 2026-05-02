@@ -1,6 +1,7 @@
 package proxmox
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 
 	kubenodesmithv1alpha1 "github.com/StealthBadger747/KubeNodeSmith/api/v1alpha1"
 	kube "github.com/StealthBadger747/KubeNodeSmith/internal/kube"
@@ -47,11 +49,31 @@ type Credentials struct {
 type Provider struct {
 	client proxmoxapi.Client
 	opts   Options
+
+	// vmIDMu serializes VMID allocation so concurrent ProvisionMachine calls
+	// can't pick the same ID from a stale snapshot of the cluster's VM list.
+	vmIDMu sync.Mutex
 }
 
 const proxmoxStatusOnline = "online"
 
 var errVMNotFound = errors.New("proxmox: vm not found")
+
+// hasManagedTag returns true when the Proxmox tag list contains an exact match
+// for tag. Proxmox stores tags as a string separated by ';' or ',', so a naive
+// substring check produces false positives when one tag is a prefix of another
+// (e.g. "kns" matching "knsxxx").
+func hasManagedTag(tagList, tag string) bool {
+	if tag == "" || tagList == "" {
+		return false
+	}
+	for _, raw := range strings.FieldsFunc(tagList, func(r rune) bool { return r == ';' || r == ',' }) {
+		if strings.TrimSpace(raw) == tag {
+			return true
+		}
+	}
+	return false
+}
 
 // Endpoint returns the API endpoint configured for this provider.
 func (p *Provider) Endpoint() string {
@@ -67,17 +89,11 @@ func generateNewVMID(clusterResources proxmoxapi.ClusterResources, opts Options)
 		return 0, fmt.Errorf("vmid range overflow")
 	}
 
-	existingVMIDs := make([]uint64, 0, len(clusterResources))
-
+	used := make(map[uint64]struct{}, len(clusterResources))
 	for _, resource := range clusterResources {
 		if resource.VMID >= opts.VMIDRange.Lower && resource.VMID <= opts.VMIDRange.Upper {
-			existingVMIDs = append(existingVMIDs, resource.VMID)
+			used[resource.VMID] = struct{}{}
 		}
-	}
-
-	used := make(map[uint64]struct{}, len(existingVMIDs))
-	for _, id := range existingVMIDs {
-		used[id] = struct{}{}
 	}
 	if uint64(len(used)) >= span {
 		return 0, fmt.Errorf("no VMIDs available in range [%d,%d]", opts.VMIDRange.Lower, opts.VMIDRange.Upper)
@@ -97,7 +113,9 @@ func generateNewVMID(clusterResources proxmoxapi.ClusterResources, opts Options)
 	return 0, fmt.Errorf("no VMIDs available in range [%d,%d]", opts.VMIDRange.Lower, opts.VMIDRange.Upper)
 }
 
-// Generates a randomized MAC address
+// Generates a randomized MAC address. If prefix specifies the first byte
+// explicitly, the user's choice is preserved; otherwise we set the unicast +
+// locally-administered bits on the random byte 0.
 func generateRandomMAC(prefix string) string {
 	b := [6]byte{
 		byte(rand.Uint32N(256)),
@@ -107,6 +125,7 @@ func generateRandomMAC(prefix string) string {
 		byte(rand.Uint32N(256)),
 		byte(rand.Uint32N(256)),
 	}
+	byte0Set := false
 	if prefix != "" {
 		parts := strings.Split(prefix, ":")
 		for i := 0; i < len(parts) && i < len(b); i++ {
@@ -115,11 +134,16 @@ func generateRandomMAC(prefix string) string {
 			}
 			if val, err := strconv.ParseUint(parts[i], 16, 8); err == nil {
 				b[i] = byte(val)
+				if i == 0 {
+					byte0Set = true
+				}
 			}
 		}
 	}
-	b[0] &^= 0x01 // ensure unicast
-	b[0] |= 0x02  // locally administered
+	if !byte0Set {
+		b[0] &^= 0x01 // unicast
+		b[0] |= 0x02  // locally administered
+	}
 	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4], b[5])
 }
 
@@ -319,7 +343,7 @@ func (p *Provider) getAvailableNode(ctx context.Context, spec provider.MachineSp
 			continue
 		}
 
-		// Passed basic checks—return the live node handle.
+		// Passed basic checks; return the live node handle.
 		n, err := p.client.Node(ctx, name)
 		if err != nil {
 			// If node fetch fails transiently, try the next candidate.
@@ -339,18 +363,19 @@ func buildVirtualMachineOptions(machineName string, spec provider.MachineSpec, o
 	}
 
 	vmOpts := make([]proxmoxapi.VirtualMachineOption, 0, len(opts.Proxmox.VMOptions)+len(opts.Proxmox.NetworkInterfaces)+8)
+	idx := make(map[string]int, len(opts.Proxmox.VMOptions))
 
 	for _, opt := range opts.Proxmox.VMOptions {
+		idx[opt.Name] = len(vmOpts)
 		vmOpts = append(vmOpts, proxmoxapi.VirtualMachineOption{Name: opt.Name, Value: opt.Value})
 	}
 
 	setOption := func(name string, value any) {
-		for i := range vmOpts {
-			if vmOpts[i].Name == name {
-				vmOpts[i].Value = value
-				return
-			}
+		if i, ok := idx[name]; ok {
+			vmOpts[i].Value = value
+			return
 		}
+		idx[name] = len(vmOpts)
 		vmOpts = append(vmOpts, proxmoxapi.VirtualMachineOption{Name: name, Value: value})
 	}
 
@@ -364,15 +389,9 @@ func buildVirtualMachineOptions(machineName string, spec provider.MachineSpec, o
 	setOption("memory", memory)
 	setOption("cores", spec.CPUCores)
 
-	for idx, nic := range opts.Proxmox.NetworkInterfaces {
-		name := nic.Name
-		if name == "" {
-			name = fmt.Sprintf("net%d", idx)
-		}
-		model := nic.Model
-		if model == "" {
-			model = "virtio"
-		}
+	for i, nic := range opts.Proxmox.NetworkInterfaces {
+		name := cmp.Or(nic.Name, fmt.Sprintf("net%d", i))
+		model := cmp.Or(nic.Model, "virtio")
 		mac := generateRandomMAC(nic.MACPrefix)
 		parts := []string{fmt.Sprintf("%s=%s", model, mac)}
 		if nic.Bridge != "" {
@@ -389,13 +408,20 @@ func buildVirtualMachineOptions(machineName string, spec provider.MachineSpec, o
 
 // ProvisionMachine creates a new VM in the Proxmox cluster that will eventually join the Kubernetes cluster.
 func (p *Provider) ProvisionMachine(ctx context.Context, spec provider.MachineSpec) (*provider.Machine, error) {
-	// Idempotency: if a VM with this machine name already exists, reuse it
+	// Idempotency: only adopt an existing VM when it carries the managed tag.
+	// Otherwise a manually-created VM with the same name would be silently adopted.
 	if existingVM, err := findNodeByVMName(spec.MachineName, ctx, &p.client); err == nil {
-		fmt.Printf("Found existing VM %s on node %s; reusing\n", spec.MachineName, existingVM.Node)
+		if !hasManagedTag(existingVM.Tags, p.opts.managedNodeTag) {
+			return nil, fmt.Errorf("VM %s exists on node %s but lacks managed tag %q; refusing to adopt",
+				spec.MachineName, existingVM.Node, p.opts.managedNodeTag)
+		}
+		fmt.Printf("Found existing managed VM %s on node %s; reusing\n", spec.MachineName, existingVM.Node)
 		if !existingVM.IsRunning() {
-			if task, startErr := existingVM.Start(ctx); startErr != nil {
+			task, startErr := existingVM.Start(ctx)
+			if startErr != nil {
 				return nil, fmt.Errorf("start existing vm %s: %w", spec.MachineName, startErr)
-			} else if waitErr := task.WaitFor(ctx, 600); waitErr != nil {
+			}
+			if waitErr := task.WaitFor(ctx, 600); waitErr != nil {
 				return nil, fmt.Errorf("wait for existing vm %s start: %w", spec.MachineName, waitErr)
 			}
 		}
@@ -403,25 +429,31 @@ func (p *Provider) ProvisionMachine(ctx context.Context, spec provider.MachineSp
 			ProviderID:   fmt.Sprintf("proxmox://%s", spec.MachineName),
 			KubeNodeName: spec.MachineName,
 		}, nil
-	} else if err != nil && !errors.Is(err, errVMNotFound) {
+	} else if !errors.Is(err, errVMNotFound) {
 		return nil, fmt.Errorf("check existing vm: %w", err)
 	}
 
+	// Serialize VMID allocation across concurrent provisions on this provider
+	// so they don't pick the same ID from a stale cluster snapshot.
+	p.vmIDMu.Lock()
 	cluster, err := p.client.Cluster(ctx)
 	if err != nil {
+		p.vmIDMu.Unlock()
 		return nil, fmt.Errorf("get cluster: %w", err)
 	}
 	clusterResources, err := cluster.Resources(ctx, "vm")
 	if err != nil {
+		p.vmIDMu.Unlock()
 		return nil, fmt.Errorf("get cluster resources: %w", err)
 	}
-
 	newVMID, err := generateNewVMID(clusterResources, p.opts)
 	if err != nil {
+		p.vmIDMu.Unlock()
 		return nil, fmt.Errorf("allocate VMID: %w", err)
 	}
 	proxNode, err := p.getAvailableNode(ctx, spec)
 	if err != nil {
+		p.vmIDMu.Unlock()
 		return nil, fmt.Errorf("get available proxmox node: %w", err)
 	}
 
@@ -429,10 +461,14 @@ func (p *Provider) ProvisionMachine(ctx context.Context, spec provider.MachineSp
 
 	vmOptions, err := buildVirtualMachineOptions(spec.MachineName, spec, p.opts)
 	if err != nil {
+		p.vmIDMu.Unlock()
 		return nil, fmt.Errorf("build VM options: %w", err)
 	}
 
 	newVMTask, err := proxNode.NewVirtualMachine(ctx, newVMID, vmOptions...)
+	// VMID is now committed to Proxmox state; release the allocator lock
+	// regardless of whether NewVirtualMachine succeeded.
+	p.vmIDMu.Unlock()
 	if err != nil {
 		return nil, fmt.Errorf("create new VM: %w", err)
 	}
@@ -497,14 +533,14 @@ func (p *Provider) DeprovisionMachine(ctx context.Context, machine provider.Mach
 	proxVM, err := findNodeByVMName(machine.KubeNodeName, ctx, &p.client)
 	if err != nil {
 		if errors.Is(err, errVMNotFound) {
-			return fmt.Errorf("VM with name '%s' not found", machine.KubeNodeName)
+			return fmt.Errorf("VM %q not found: %w", machine.KubeNodeName, errVMNotFound)
 		}
 		return err
 	}
 
-	if !strings.Contains(proxVM.Tags, p.opts.managedNodeTag) {
-		err := fmt.Errorf("refusing to delete targeted VM `%s` in node %s because it does not have required tag", proxVM.Name, machine.KubeNodeName)
-		return err
+	if !hasManagedTag(proxVM.Tags, p.opts.managedNodeTag) {
+		return fmt.Errorf("refusing to delete VM %q on node %s: missing managed tag %q",
+			proxVM.Name, machine.KubeNodeName, p.opts.managedNodeTag)
 	}
 
 	stopVMTask, err := proxVM.Stop(ctx)
@@ -554,7 +590,7 @@ func (p *Provider) ListMachines(ctx context.Context, namePrefix string) ([]provi
 			continue
 		}
 		for _, vm := range vms {
-			if strings.HasPrefix(vm.Name, namePrefix) && strings.Contains(vm.Tags, p.opts.managedNodeTag) {
+			if strings.HasPrefix(vm.Name, namePrefix) && hasManagedTag(vm.Tags, p.opts.managedNodeTag) {
 				machines = append(machines, provider.Machine{
 					ProviderID:   vm.Name,
 					KubeNodeName: vm.Name,

@@ -1,11 +1,14 @@
 package controller
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"maps"
 	"math"
-	"sort"
+	"slices"
 	"strconv"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -61,6 +64,21 @@ type NodePoolReconciler struct {
 	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
 	Config   *rest.Config
+
+	csOnce sync.Once
+	cs     *kubernetes.Clientset
+	csErr  error
+}
+
+func (r *NodePoolReconciler) clientset() (*kubernetes.Clientset, error) {
+	r.csOnce.Do(func() {
+		cfg := r.Config
+		if cfg == nil {
+			cfg = ctrl.GetConfigOrDie()
+		}
+		r.cs, r.csErr = kubernetes.NewForConfig(cfg)
+	})
+	return r.cs, r.csErr
 }
 
 // +kubebuilder:rbac:groups=kubenodesmith.parawell.cloud,resources=nodesmithpools,verbs=get;list;watch;create;update;patch;delete
@@ -75,37 +93,11 @@ type NodePoolReconciler struct {
 // move the current state of the cluster closer to the desired state.
 func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := logf.FromContext(ctx).WithValues("nodesmithpool", req.NamespacedName)
-	config := r.Config
-	if config == nil {
-		config = ctrl.GetConfigOrDie()
-	}
-	cs, err := kubernetes.NewForConfig(config)
+	cs, err := r.clientset()
 	if err != nil {
 		logger.Error(err, "failed to build kubernetes clientset")
 		return ctrl.Result{}, err
 	}
-
-	// High-level reconciliation outline:
-	// 1. Fetch the NodeSmithPool; return gracefully if it no longer exists.
-	// 2. Capture a logger scoped to the pool and stash a deep copy of the original status.
-	// 3. If deletion timestamp is set, ensure finalizers run: drain provider-owned machines,
-	//    delete or release NodeSmithClaims, update status, then remove the finalizer.
-	// 4. Validate spec invariants (providerRef present, limits sane, scale policies valid) and
-	//    surface configuration errors via status conditions.
-	// 5. Resolve the referenced NodeSmithProvider, initializing the concrete provider client and
-	//    failing early if credentials/options are missing.
-	// 6. List NodeSmithClaims tied to this pool and correlate them with provider machines and
-	//    registered Kubernetes nodes to understand actual capacity.
-	// 7. Determine desired capacity using min/max limits, outstanding claims, and scale-up/down
-	//    policies (batch size, stabilization windows, drain concurrency, etc.).
-	// 8. Handle scale-up by creating new NodeSmithClaims and, when ready, issuing ProvisionMachine
-	//    calls with appropriate MachineSpec derived from the pool template and limits.
-	// 9. Handle scale-down by picking surplus machines, coordinating node cordon/drain, updating
-	//    the corresponding claims, and calling DeprovisionMachine respecting drain timeouts.
-	// 10. Ensure machines/nodes carry the pool label key, template labels, taints, and other
-	//     desired metadata; detect drift and record conditions/events.
-	// 11. Update status (ObservedGeneration, Conditions, LastScaleActivity, counts) and emit
-	//     events; decide whether to requeue immediately or after backoff based on ongoing work.
 
 	var nodePool kubenodesmithv1alpha1.NodeSmithPool
 	if err := r.Get(ctx, req.NamespacedName, &nodePool); err != nil {
@@ -305,11 +297,7 @@ func (r *NodePoolReconciler) reconcileScaleUp(
 		return ctrl.Result{}, nil
 	}
 
-	pendingCount, pendingCPUMilli, pendingMemBytes, err := countInflightClaims(nodePool, &claims)
-	if err != nil {
-		logger.Error(err, "count inflight claims")
-		return ctrl.Result{RequeueAfter: time.Minute}, nil
-	}
+	inflight := countInflightClaims(nodePool, &claims)
 
 	poolUsage, err := kube.GetPoolResourceUsage(ctx, cs, nodePool)
 	if err != nil {
@@ -318,12 +306,12 @@ func (r *NodePoolReconciler) reconcileScaleUp(
 	}
 
 	currentNodes := len(nodesInPool)
-	if nodePool.Spec.Limits.MaxNodes > 0 && currentNodes+pendingCount+len(newClaimSpecs) > nodePool.Spec.Limits.MaxNodes {
-		msg := fmt.Sprintf("Pool at max capacity: %d/%d nodes (including %d pending)", currentNodes+pendingCount, nodePool.Spec.Limits.MaxNodes, pendingCount)
+	if nodePool.Spec.Limits.MaxNodes > 0 && currentNodes+inflight.count+len(newClaimSpecs) > nodePool.Spec.Limits.MaxNodes {
+		msg := fmt.Sprintf("Pool at max capacity: %d/%d nodes (including %d pending)", currentNodes+inflight.count, nodePool.Spec.Limits.MaxNodes, inflight.count)
 		logger.Info("node pool at or above max size; skipping scale up",
 			"maxNodes", nodePool.Spec.Limits.MaxNodes,
 			"currentNodes", currentNodes,
-			"pendingClaims", pendingCount,
+			"pendingClaims", inflight.count,
 		)
 		r.Recorder.Eventf(nodePool, corev1.EventTypeWarning, "ScaleUpBlocked", msg)
 		if updateErr := r.updateStatus(ctx, nodePool, func(p *kubenodesmithv1alpha1.NodeSmithPool) {
@@ -346,7 +334,7 @@ func (r *NodePoolReconciler) reconcileScaleUp(
 		newMemBytes += spec.memoryMiB * 1024 * 1024
 	}
 
-	if exceeded, reason := exceedsPoolLimits(poolUsage, &nodePool.Spec.Limits, pendingCPUMilli, pendingMemBytes, newCPUMilli, newMemBytes); exceeded {
+	if exceeded, reason := exceedsPoolLimits(poolUsage, &nodePool.Spec.Limits, inflight.cpuMilli, inflight.memBytes, newCPUMilli, newMemBytes); exceeded {
 		logger.Info("skipping scale up due to resource limits", "reason", reason)
 		r.Recorder.Eventf(nodePool, corev1.EventTypeWarning, "ScaleUpBlocked", reason)
 		if updateErr := r.updateStatus(ctx, nodePool, func(p *kubenodesmithv1alpha1.NodeSmithPool) {
@@ -419,19 +407,11 @@ func (r *NodePoolReconciler) ensureClaim(
 		return fmt.Errorf("get existing claim %s: %w", claimName, err)
 	}
 
-	labels := map[string]string{}
-	if nodePool.Spec.PoolLabelKey != "" {
-		labels[nodePool.Spec.PoolLabelKey] = nodePool.Name
-	}
-	for k, v := range nodePool.Spec.MachineTemplate.Labels {
-		labels[k] = v
-	}
-
 	claim := &kubenodesmithv1alpha1.NodeSmithClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      claimName,
 			Namespace: nodePool.Namespace,
-			Labels:    labels,
+			Labels:    buildPoolLabelSet(nodePool),
 		},
 		Spec: kubenodesmithv1alpha1.NodeSmithClaimSpec{
 			PoolRef: nodePool.Name,
@@ -472,13 +452,11 @@ func filterPodsForPool(pods []corev1.Pod, pool *kubenodesmithv1alpha1.NodeSmithP
 }
 
 func buildPoolLabelSet(pool *kubenodesmithv1alpha1.NodeSmithPool) map[string]string {
-	labels := map[string]string{}
+	labels := make(map[string]string, len(pool.Spec.MachineTemplate.Labels)+1)
 	if pool.Spec.PoolLabelKey != "" {
 		labels[pool.Spec.PoolLabelKey] = pool.Name
 	}
-	for k, v := range pool.Spec.MachineTemplate.Labels {
-		labels[k] = v
-	}
+	maps.Copy(labels, pool.Spec.MachineTemplate.Labels)
 	return labels
 }
 
@@ -529,16 +507,21 @@ func podMatchesPool(pod *corev1.Pod, pool *kubenodesmithv1alpha1.NodeSmithPool, 
 }
 
 func nodeSelectorTermMatches(term corev1.NodeSelectorTerm, pool *kubenodesmithv1alpha1.NodeSmithPool, labels map[string]string) (bool, bool) {
+	// MatchFields targets concrete node fields (e.g., metadata.name), which we
+	// can't evaluate against a not-yet-created machine. Fail closed.
+	if len(term.MatchFields) > 0 {
+		return false, false
+	}
 	requiresPool := false
 	for _, expr := range term.MatchExpressions {
 		value, hasLabel := labels[expr.Key]
 		switch expr.Operator {
 		case corev1.NodeSelectorOpIn:
-			if !hasLabel || !containsString(expr.Values, value) {
+			if !hasLabel || !slices.Contains(expr.Values, value) {
 				return false, false
 			}
 		case corev1.NodeSelectorOpNotIn:
-			if hasLabel && containsString(expr.Values, value) {
+			if hasLabel && slices.Contains(expr.Values, value) {
 				return false, false
 			}
 		case corev1.NodeSelectorOpExists:
@@ -573,15 +556,6 @@ func nodeSelectorTermMatches(term corev1.NodeSelectorTerm, pool *kubenodesmithv1
 		}
 	}
 	return true, requiresPool
-}
-
-func containsString(list []string, target string) bool {
-	for _, v := range list {
-		if v == target {
-			return true
-		}
-	}
-	return false
 }
 
 func determineNodeCapacity(nodes []corev1.Node, claims *kubenodesmithv1alpha1.NodeSmithClaimList, pods []corev1.Pod) nodeCapacity {
@@ -686,8 +660,8 @@ func planCapacity(pods []corev1.Pod, buckets []capacityBucket, template nodeCapa
 		}
 		demands = append(demands, podDemand{pod: pods[i], cpuMilli: cpu, memBytes: mem})
 	}
-	sort.SliceStable(demands, func(i, j int) bool {
-		return demands[i].cpuMilli > demands[j].cpuMilli
+	slices.SortStableFunc(demands, func(a, b podDemand) int {
+		return cmp.Compare(b.cpuMilli, a.cpuMilli)
 	})
 	newClaims := make([]claimResources, 0)
 	for _, demand := range demands {
@@ -818,11 +792,7 @@ func (r *NodePoolReconciler) refreshPoolStatus(ctx context.Context, nodePool *ku
 		return
 	}
 
-	pendingCount, pendingCPUMilli, pendingMemBytes, err := countInflightClaims(nodePool, &claims)
-	if err != nil {
-		logger.Error(err, "count inflight claims for status check")
-		return
-	}
+	inflight := countInflightClaims(nodePool, &claims)
 
 	poolUsage, err := kube.GetPoolResourceUsage(ctx, cs, nodePool)
 	if err != nil {
@@ -838,12 +808,12 @@ func (r *NodePoolReconciler) refreshPoolStatus(ctx context.Context, nodePool *ku
 		ObservedGeneration: nodePool.Generation,
 	}
 
-	if nodePool.Spec.Limits.MaxNodes > 0 && poolUsage.NodeCount+pendingCount >= nodePool.Spec.Limits.MaxNodes {
-		msg := fmt.Sprintf("Pool at max capacity: %d/%d nodes (including %d pending)", poolUsage.NodeCount+pendingCount, nodePool.Spec.Limits.MaxNodes, pendingCount)
+	if nodePool.Spec.Limits.MaxNodes > 0 && poolUsage.NodeCount+inflight.count >= nodePool.Spec.Limits.MaxNodes {
+		msg := fmt.Sprintf("Pool at max capacity: %d/%d nodes (including %d pending)", poolUsage.NodeCount+inflight.count, nodePool.Spec.Limits.MaxNodes, inflight.count)
 		availableCond.Status = metav1.ConditionFalse
 		availableCond.Reason = "MaxNodesReached"
 		availableCond.Message = msg
-	} else if exceeded, reason := exceedsPoolLimits(poolUsage, &nodePool.Spec.Limits, pendingCPUMilli, pendingMemBytes, 0, 0); exceeded {
+	} else if exceeded, reason := exceedsPoolLimits(poolUsage, &nodePool.Spec.Limits, inflight.cpuMilli, inflight.memBytes, 0, 0); exceeded {
 		availableCond.Status = metav1.ConditionFalse
 		availableCond.Reason = "ResourceLimitReached"
 		availableCond.Message = reason

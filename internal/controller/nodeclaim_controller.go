@@ -1,8 +1,10 @@
 package controller
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"strings"
 	"time"
@@ -73,7 +75,7 @@ type NodeClaimReconciler struct {
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=volumeattachments,verbs=get;list
 
 // Reconcile implements the main reconciliation loop for NodeSmithClaim.
-// It follows the Karpenter lifecycle pattern: Launch → Register → Initialize → Ready
+// It follows the Karpenter lifecycle pattern: Launch -> Register -> Initialize -> Ready
 func (r *NodeClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := logf.FromContext(ctx).WithValues("nodesmithclaim", req.NamespacedName)
 
@@ -107,16 +109,15 @@ func (r *NodeClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, nil
 	}
 
-	if result, err := r.reconcileLaunch(ctx, &claim); result != nil || err != nil {
-		return *result, err
+	phases := []func(context.Context, *kubenodesmithv1alpha1.NodeSmithClaim) (*ctrl.Result, error){
+		r.reconcileLaunch,
+		r.reconcileRegistration,
+		r.reconcileInitialization,
 	}
-
-	if result, err := r.reconcileRegistration(ctx, &claim); result != nil || err != nil {
-		return *result, err
-	}
-
-	if result, err := r.reconcileInitialization(ctx, &claim); result != nil || err != nil {
-		return *result, err
+	for _, phase := range phases {
+		if result, err := phase(ctx, &claim); result != nil || err != nil {
+			return *result, err
+		}
 	}
 
 	// All phases complete - claim is ready
@@ -130,6 +131,17 @@ func (r *NodeClaimReconciler) reconcileLaunch(ctx context.Context, claim *kubeno
 	// Already launched? Check providerID
 	if claim.Status.ProviderID != "" {
 		return nil, nil // Machine already provisioned, move to next phase
+	}
+
+	// Spec.Requirements is required for provisioning. Fail loudly rather than passing zeros to the provider.
+	if claim.Spec.Requirements == nil {
+		if err := r.updateStatus(ctx, claim, func(updated *kubenodesmithv1alpha1.NodeSmithClaim) {
+			setClaimCondition(updated, kubenodesmithv1alpha1.ConditionTypeFailed, metav1.ConditionTrue, "RequirementsMissing", "spec.requirements is required to provision a machine")
+			setClaimCondition(updated, kubenodesmithv1alpha1.ConditionTypeLaunched, metav1.ConditionFalse, "RequirementsMissing", "spec.requirements is required to provision a machine")
+		}); err != nil {
+			return &ctrl.Result{}, err
+		}
+		return &ctrl.Result{}, nil
 	}
 
 	// Respect any in-progress launch lease
@@ -182,22 +194,8 @@ func (r *NodeClaimReconciler) reconcileLaunch(ctx context.Context, claim *kubeno
 		}
 
 		if err := r.updateStatus(ctx, claim, func(updated *kubenodesmithv1alpha1.NodeSmithClaim) {
-			setCondition := func(condType string, isTrue bool) {
-				status := metav1.ConditionFalse
-				if isTrue {
-					status = metav1.ConditionTrue
-				}
-				meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
-					Type:               condType,
-					Status:             status,
-					Reason:             "LaunchAttemptsExceeded",
-					Message:            message,
-					ObservedGeneration: updated.Generation,
-				})
-			}
-
-			setCondition(kubenodesmithv1alpha1.ConditionTypeFailed, true)
-			setCondition(kubenodesmithv1alpha1.ConditionTypeLaunched, false)
+			setClaimCondition(updated, kubenodesmithv1alpha1.ConditionTypeFailed, metav1.ConditionTrue, "LaunchAttemptsExceeded", message)
+			setClaimCondition(updated, kubenodesmithv1alpha1.ConditionTypeLaunched, metav1.ConditionFalse, "LaunchAttemptsExceeded", message)
 		}); err != nil {
 			logger.Error(err, "failed to update status after exceeding launch attempts")
 			return &ctrl.Result{}, err
@@ -242,13 +240,7 @@ func (r *NodeClaimReconciler) reconcileLaunch(ctx context.Context, claim *kubeno
 	if err != nil {
 		logger.Error(err, "failed to get provider for claim")
 		if updateErr := r.updateStatus(ctx, claim, func(updated *kubenodesmithv1alpha1.NodeSmithClaim) {
-			meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
-				Type:               kubenodesmithv1alpha1.ConditionTypeLaunched,
-				Status:             metav1.ConditionFalse,
-				Reason:             "ProviderError",
-				Message:            fmt.Sprintf("Failed to get provider: %v", err),
-				ObservedGeneration: updated.Generation,
-			})
+			setClaimCondition(updated, kubenodesmithv1alpha1.ConditionTypeLaunched, metav1.ConditionFalse, "ProviderError", fmt.Sprintf("Failed to get provider: %v", err))
 		}); updateErr != nil {
 			logger.Error(updateErr, "failed to update status after provider error")
 		}
@@ -271,13 +263,7 @@ func (r *NodeClaimReconciler) reconcileLaunch(ctx context.Context, claim *kubeno
 		logger.Error(err, "failed to provision machine")
 		if updateErr := r.updateStatus(ctx, claim, func(updated *kubenodesmithv1alpha1.NodeSmithClaim) {
 			updated.Status.LaunchAttempts = nextAttempt
-			meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
-				Type:               kubenodesmithv1alpha1.ConditionTypeLaunched,
-				Status:             metav1.ConditionFalse,
-				Reason:             "ProvisioningFailed",
-				Message:            fmt.Sprintf("Failed to provision machine: %v", err),
-				ObservedGeneration: updated.Generation,
-			})
+			setClaimCondition(updated, kubenodesmithv1alpha1.ConditionTypeLaunched, metav1.ConditionFalse, "ProvisioningFailed", fmt.Sprintf("Failed to provision machine: %v", err))
 		}); updateErr != nil {
 			logger.Error(updateErr, "failed to update status after provisioning error")
 		}
@@ -289,19 +275,12 @@ func (r *NodeClaimReconciler) reconcileLaunch(ctx context.Context, claim *kubeno
 		"kubeNodeName", machine.KubeNodeName,
 	)
 
-	// CRITICAL: Store the providerID immediately
-	claim.Status.ProviderID = machine.ProviderID
-
+	// updateStatus re-reads the claim, so the persisted state below is the
+	// only authoritative write. No need to set claim.Status.ProviderID in memory first.
 	if err := r.updateStatus(ctx, claim, func(updated *kubenodesmithv1alpha1.NodeSmithClaim) {
 		updated.Status.ProviderID = machine.ProviderID
 		updated.Status.LaunchAttempts = nextAttempt
-		meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
-			Type:               kubenodesmithv1alpha1.ConditionTypeLaunched,
-			Status:             metav1.ConditionTrue,
-			Reason:             "Launched",
-			Message:            fmt.Sprintf("Machine provisioned: %s", machine.ProviderID),
-			ObservedGeneration: updated.Generation,
-		})
+		setClaimCondition(updated, kubenodesmithv1alpha1.ConditionTypeLaunched, metav1.ConditionTrue, "Launched", fmt.Sprintf("Machine provisioned: %s", machine.ProviderID))
 	}); err != nil {
 		logger.Error(err, "failed to update status after launch")
 		return &ctrl.Result{}, err
@@ -377,13 +356,7 @@ func (r *NodeClaimReconciler) reconcileRegistration(ctx context.Context, claim *
 				updated.Status.NodeName = node.Name
 				updated.Status.LaunchAttempts = 0
 				meta.RemoveStatusCondition(&updated.Status.Conditions, kubenodesmithv1alpha1.ConditionTypeFailed)
-				meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
-					Type:               kubenodesmithv1alpha1.ConditionTypeRegistered,
-					Status:             metav1.ConditionTrue,
-					Reason:             "Registered",
-					Message:            fmt.Sprintf("Node %s joined cluster", node.Name),
-					ObservedGeneration: updated.Generation,
-				})
+				setClaimCondition(updated, kubenodesmithv1alpha1.ConditionTypeRegistered, metav1.ConditionTrue, "Registered", fmt.Sprintf("Node %s joined cluster", node.Name))
 			}); err != nil {
 				logger.Error(err, "failed to update status after registration")
 				return &ctrl.Result{}, err
@@ -399,34 +372,19 @@ func (r *NodeClaimReconciler) reconcileRegistration(ctx context.Context, claim *
 	if launchedCond != nil {
 		timeSinceLaunch := time.Since(launchedCond.LastTransitionTime.Time)
 		if timeSinceLaunch > registrationTimeout {
-			// Timeout! Fail the claim and deprovision the machine
 			logger.Info("registration timeout exceeded", "elapsed", timeSinceLaunch)
 
-			// Deprovision the machine
-			prov, err := r.getProviderForClaim(ctx, claim)
-			if err != nil {
-				logger.Error(err, "failed to get provider for deprovisioning after timeout")
-			} else {
-				machine := provider.Machine{
-					ProviderID:   claim.Status.ProviderID,
-					KubeNodeName: claim.Status.NodeName,
-				}
-				if err := prov.DeprovisionMachine(ctx, machine); err != nil {
-					logger.Error(err, "failed to deprovision machine after timeout")
-					// Continue anyway - we mark this as failed regardless
-				} else {
-					logger.Info("machine deprovisioned after registration timeout")
-					r.Recorder.Eventf(claim, corev1.EventTypeWarning, "MachineDeprovisioned",
-						"Machine deprovisioned due to registration timeout")
-				}
+			// Try to release the orphaned VM. If deprovision fails we MUST keep
+			// ProviderID. It is the only handle to the leaked machine. Requeue
+			// and try again rather than abandoning it.
+			if deprovisionErr := r.deprovisionClaimMachine(ctx, claim, "registration timeout"); deprovisionErr != nil {
+				return &ctrl.Result{RequeueAfter: requeueOnError}, deprovisionErr
 			}
 
-			claim.Status.ProviderID = ""
 			attempts := claim.Status.LaunchAttempts
 			if attempts == 0 {
 				attempts = 1
 			}
-
 			maxAttemptsReached := attempts >= maxLaunchAttempts
 			var registeredMessage string
 			if maxAttemptsReached {
@@ -437,39 +395,15 @@ func (r *NodeClaimReconciler) reconcileRegistration(ctx context.Context, claim *
 
 			if err := r.updateStatus(ctx, claim, func(updated *kubenodesmithv1alpha1.NodeSmithClaim) {
 				updated.Status.ProviderID = ""
-				meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
-					Type:               kubenodesmithv1alpha1.ConditionTypeRegistered,
-					Status:             metav1.ConditionFalse,
-					Reason:             "Timeout",
-					Message:            registeredMessage,
-					ObservedGeneration: updated.Generation,
-				})
+				setClaimCondition(updated, kubenodesmithv1alpha1.ConditionTypeRegistered, metav1.ConditionFalse, "Timeout", registeredMessage)
 
 				if maxAttemptsReached {
-					meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
-						Type:               kubenodesmithv1alpha1.ConditionTypeLaunched,
-						Status:             metav1.ConditionFalse,
-						Reason:             "RegistrationTimeoutExceeded",
-						Message:            registeredMessage,
-						ObservedGeneration: updated.Generation,
-					})
-					meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
-						Type:               kubenodesmithv1alpha1.ConditionTypeFailed,
-						Status:             metav1.ConditionTrue,
-						Reason:             "RegistrationTimeoutExceeded",
-						Message:            registeredMessage,
-						ObservedGeneration: updated.Generation,
-					})
+					setClaimCondition(updated, kubenodesmithv1alpha1.ConditionTypeLaunched, metav1.ConditionFalse, "RegistrationTimeoutExceeded", registeredMessage)
+					setClaimCondition(updated, kubenodesmithv1alpha1.ConditionTypeFailed, metav1.ConditionTrue, "RegistrationTimeoutExceeded", registeredMessage)
 					return
 				}
-
-				meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
-					Type:               kubenodesmithv1alpha1.ConditionTypeLaunched,
-					Status:             metav1.ConditionFalse,
-					Reason:             "RegistrationTimeout",
-					Message:            fmt.Sprintf("Cleared provider ID to retry launch (%d/%d)", attempts+1, maxLaunchAttempts),
-					ObservedGeneration: updated.Generation,
-				})
+				setClaimCondition(updated, kubenodesmithv1alpha1.ConditionTypeLaunched, metav1.ConditionFalse, "RegistrationTimeout",
+					fmt.Sprintf("Cleared provider ID to retry launch (%d/%d)", attempts+1, maxLaunchAttempts))
 			}); err != nil {
 				logger.Error(err, "failed to update status after registration timeout")
 				return &ctrl.Result{}, err
@@ -483,7 +417,6 @@ func (r *NodeClaimReconciler) reconcileRegistration(ctx context.Context, claim *
 
 			r.Recorder.Eventf(claim, corev1.EventTypeWarning, "RegistrationTimeout",
 				"Node did not register within %v (attempt %d/%d); retrying", registrationTimeout, attempts, maxLaunchAttempts)
-
 			return &ctrl.Result{RequeueAfter: immediateRequeueDelay}, nil
 		}
 
@@ -548,21 +481,8 @@ func (r *NodeClaimReconciler) reconcileInitialization(ctx context.Context, claim
 	logger.Info("node is ready", "nodeName", node.Name)
 
 	if err := r.updateStatus(ctx, claim, func(updated *kubenodesmithv1alpha1.NodeSmithClaim) {
-		meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
-			Type:               kubenodesmithv1alpha1.ConditionTypeInitialized,
-			Status:             metav1.ConditionTrue,
-			Reason:             "Initialized",
-			Message:            "Node is ready",
-			ObservedGeneration: updated.Generation,
-		})
-
-		meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
-			Type:               kubenodesmithv1alpha1.ConditionTypeReady,
-			Status:             metav1.ConditionTrue,
-			Reason:             "Ready",
-			Message:            "Claim is fully operational",
-			ObservedGeneration: updated.Generation,
-		})
+		setClaimCondition(updated, kubenodesmithv1alpha1.ConditionTypeInitialized, metav1.ConditionTrue, "Initialized", "Node is ready")
+		setClaimCondition(updated, kubenodesmithv1alpha1.ConditionTypeReady, metav1.ConditionTrue, "Ready", "Claim is fully operational")
 	}); err != nil {
 		logger.Error(err, "failed to update status after initialization")
 		return &ctrl.Result{}, err
@@ -609,51 +529,9 @@ func (r *NodeClaimReconciler) finalize(ctx context.Context, claim *kubenodesmith
 	}
 
 	// Step 2: Deprovision the machine from provider
-	if claim.Status.ProviderID != "" {
-		logger.Info("deprovisioning machine", "providerID", claim.Status.ProviderID)
-
-		prov, err := r.getProviderForClaim(ctx, claim)
-		if err != nil {
-			// Failed to get provider - this could mean the pool or provider was deleted
-			// Log the error and emit a warning event for visibility
-			logger.Error(err, "failed to get provider for deprovisioning",
-				"providerID", claim.Status.ProviderID,
-				"pool", claim.Spec.PoolRef,
-			)
-
-			r.Recorder.Eventf(claim, corev1.EventTypeWarning, "DeprovisioningFailed",
-				"Cannot deprovision machine %s: provider unavailable. Manual cleanup may be required for pool %s",
-				claim.Status.ProviderID, claim.Spec.PoolRef)
-
-			// Check if this is a NotFound error - if so, resources were deleted
-			if apierrors.IsNotFound(err) {
-				logger.Info("pool or provider was deleted - cannot deprovision machine, manual cleanup required",
-					"providerID", claim.Status.ProviderID,
-					"pool", claim.Spec.PoolRef,
-				)
-			}
-			// Continue with finalizer removal - don't block cleanup indefinitely
-			// but the warning event provides visibility for manual intervention
-		} else {
-			machine := provider.Machine{
-				ProviderID:   claim.Status.ProviderID,
-				KubeNodeName: claim.Status.NodeName,
-			}
-			if err := prov.DeprovisionMachine(ctx, machine); err != nil {
-				logger.Error(err, "failed to deprovision machine",
-					"providerID", claim.Status.ProviderID,
-				)
-				r.Recorder.Eventf(claim, corev1.EventTypeWarning, "DeprovisioningFailed",
-					"Failed to deprovision machine %s: %v. Manual cleanup may be required",
-					claim.Status.ProviderID, err)
-				// Continue with finalizer removal - don't block cleanup
-			} else {
-				logger.Info("machine deprovisioned successfully")
-				r.Recorder.Eventf(claim, corev1.EventTypeNormal, "MachineDeprovisioned",
-					"Machine %s deprovisioned", claim.Status.ProviderID)
-			}
-		}
-	}
+	// Best-effort: don't block finalizer removal if deprovision fails. Emit
+	// a warning event for manual cleanup visibility and continue.
+	_ = r.deprovisionClaimMachine(ctx, claim, "finalize")
 
 	// Step 3: Remove finalizer (allows garbage collection)
 	logger.Info("removing finalizer")
@@ -685,72 +563,31 @@ func (r *NodeClaimReconciler) recycleUnhealthyNode(
 		}
 	}
 
-	// Attempt to deprovision the VM
-	if claim.Status.ProviderID != "" {
-		if prov, err := r.getProviderForClaim(ctx, claim); err != nil {
-			logger.Error(err, "failed to get provider while recycling", "providerID", claim.Status.ProviderID)
-		} else {
-			machine := provider.Machine{
-				ProviderID:   claim.Status.ProviderID,
-				KubeNodeName: claim.Status.NodeName,
-			}
-			if err := prov.DeprovisionMachine(ctx, machine); err != nil {
-				logger.Error(err, "failed to deprovision machine while recycling", "providerID", claim.Status.ProviderID)
-				r.Recorder.Eventf(claim, corev1.EventTypeWarning, "DeprovisioningFailed",
-					"Failed to deprovision machine %s during recycle: %v", claim.Status.ProviderID, err)
-			} else {
-				logger.Info("machine deprovisioned while recycling", "providerID", claim.Status.ProviderID)
-				r.Recorder.Eventf(claim, corev1.EventTypeNormal, "MachineDeprovisioned",
-					"Machine %s deprovisioned during recycle", claim.Status.ProviderID)
-			}
-		}
-	}
+	// Best-effort deprovision; errors here are reported but don't block recycling.
+	// The dangling VM will be re-attempted on the next launch's idempotency check.
+	_ = r.deprovisionClaimMachine(ctx, claim, "recycle")
 
 	nextAttempts := claim.Status.LaunchAttempts + 1
 	maxReached := nextAttempts >= maxLaunchAttempts
+	resetConds := []string{
+		kubenodesmithv1alpha1.ConditionTypeLaunched,
+		kubenodesmithv1alpha1.ConditionTypeRegistered,
+		kubenodesmithv1alpha1.ConditionTypeInitialized,
+		kubenodesmithv1alpha1.ConditionTypeReady,
+	}
 
 	if err := r.updateStatus(ctx, claim, func(updated *kubenodesmithv1alpha1.NodeSmithClaim) {
 		updated.Status.ProviderID = ""
 		updated.Status.NodeName = ""
 		updated.Status.LaunchAttempts = nextAttempts
 
-		meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
-			Type:               kubenodesmithv1alpha1.ConditionTypeLaunched,
-			Status:             metav1.ConditionFalse,
-			Reason:             "RecycleNotReady",
-			Message:            message,
-			ObservedGeneration: updated.Generation,
-		})
-		meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
-			Type:               kubenodesmithv1alpha1.ConditionTypeRegistered,
-			Status:             metav1.ConditionFalse,
-			Reason:             "RecycleNotReady",
-			Message:            message,
-			ObservedGeneration: updated.Generation,
-		})
-		meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
-			Type:               kubenodesmithv1alpha1.ConditionTypeInitialized,
-			Status:             metav1.ConditionFalse,
-			Reason:             "RecycleNotReady",
-			Message:            message,
-			ObservedGeneration: updated.Generation,
-		})
-		meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
-			Type:               kubenodesmithv1alpha1.ConditionTypeReady,
-			Status:             metav1.ConditionFalse,
-			Reason:             "RecycleNotReady",
-			Message:            message,
-			ObservedGeneration: updated.Generation,
-		})
+		for _, ct := range resetConds {
+			setClaimCondition(updated, ct, metav1.ConditionFalse, "RecycleNotReady", message)
+		}
 
 		if maxReached {
-			meta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
-				Type:               kubenodesmithv1alpha1.ConditionTypeFailed,
-				Status:             metav1.ConditionTrue,
-				Reason:             "RecycleNotReady",
-				Message:            fmt.Sprintf("%s; maximum launch attempts reached (%d)", message, maxLaunchAttempts),
-				ObservedGeneration: updated.Generation,
-			})
+			setClaimCondition(updated, kubenodesmithv1alpha1.ConditionTypeFailed, metav1.ConditionTrue, "RecycleNotReady",
+				fmt.Sprintf("%s; maximum launch attempts reached (%d)", message, maxLaunchAttempts))
 		} else {
 			meta.RemoveStatusCondition(&updated.Status.Conditions, kubenodesmithv1alpha1.ConditionTypeFailed)
 		}
@@ -780,6 +617,47 @@ func nodeMatchesClaim(node *corev1.Node, claim *kubenodesmithv1alpha1.NodeSmithC
 	return false
 }
 
+// setClaimCondition writes a condition stamped with the claim's current generation.
+func setClaimCondition(claim *kubenodesmithv1alpha1.NodeSmithClaim, condType string, status metav1.ConditionStatus, reason, message string) {
+	meta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
+		Type:               condType,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: claim.Generation,
+	})
+}
+
+// deprovisionClaimMachine resolves the claim's provider and asks it to release
+// the backing machine. Returns nil when the claim has no machine to release or
+// when deprovisioning succeeded; callers MUST NOT clear ProviderID on a non-nil
+// return. It is the only handle to a leaked machine.
+func (r *NodeClaimReconciler) deprovisionClaimMachine(ctx context.Context, claim *kubenodesmithv1alpha1.NodeSmithClaim, reason string) error {
+	if claim.Status.ProviderID == "" {
+		return nil
+	}
+	logger := logf.FromContext(ctx).WithValues("claim", claim.Name, "providerID", claim.Status.ProviderID, "reason", reason)
+
+	prov, err := r.getProviderForClaim(ctx, claim)
+	if err != nil {
+		logger.Error(err, "failed to get provider for deprovisioning")
+		r.Recorder.Eventf(claim, corev1.EventTypeWarning, "DeprovisioningFailed",
+			"Cannot deprovision machine %s (%s): provider unavailable: %v", claim.Status.ProviderID, reason, err)
+		return err
+	}
+	machine := provider.Machine{ProviderID: claim.Status.ProviderID, KubeNodeName: claim.Status.NodeName}
+	if err := prov.DeprovisionMachine(ctx, machine); err != nil {
+		logger.Error(err, "failed to deprovision machine")
+		r.Recorder.Eventf(claim, corev1.EventTypeWarning, "DeprovisioningFailed",
+			"Failed to deprovision machine %s (%s): %v", claim.Status.ProviderID, reason, err)
+		return err
+	}
+	logger.Info("machine deprovisioned")
+	r.Recorder.Eventf(claim, corev1.EventTypeNormal, "MachineDeprovisioned",
+		"Machine %s deprovisioned (%s)", claim.Status.ProviderID, reason)
+	return nil
+}
+
 func (r *NodeClaimReconciler) getPoolForClaim(ctx context.Context, claim *kubenodesmithv1alpha1.NodeSmithClaim) (*kubenodesmithv1alpha1.NodeSmithPool, error) {
 	var pool kubenodesmithv1alpha1.NodeSmithPool
 	key := types.NamespacedName{Namespace: claim.Namespace, Name: claim.Spec.PoolRef}
@@ -795,54 +673,40 @@ func (r *NodeClaimReconciler) ensureNodeLabels(
 	pool *kubenodesmithv1alpha1.NodeSmithPool,
 	claim *kubenodesmithv1alpha1.NodeSmithClaim,
 ) error {
-	labelKey := pool.Spec.PoolLabelKey
-	if strings.TrimSpace(labelKey) == "" {
-		labelKey = "topology.kubenodesmith.io/pool"
-	}
+	labelKey := cmp.Or(strings.TrimSpace(pool.Spec.PoolLabelKey), "topology.kubenodesmith.io/pool")
 
-	desired := node.DeepCopy()
-	if desired.Labels == nil {
-		desired.Labels = map[string]string{}
+	desired := map[string]string{
+		labelKey:                     pool.Name,
+		"kubenodesmith.io/nodeclaim": claim.Name,
 	}
+	maps.Copy(desired, pool.Spec.MachineTemplate.Labels)
 
+	// Compare against existing labels to skip a no-op patch.
 	changed := false
-	if desired.Labels[labelKey] != pool.Name {
-		desired.Labels[labelKey] = pool.Name
-		changed = true
-	}
-
-	if desired.Labels["kubenodesmith.io/nodeclaim"] != claim.Name {
-		desired.Labels["kubenodesmith.io/nodeclaim"] = claim.Name
-		changed = true
-	}
-
-	for k, v := range pool.Spec.MachineTemplate.Labels {
-		if existing, ok := desired.Labels[k]; !ok || existing != v {
-			desired.Labels[k] = v
+	for k, v := range desired {
+		if node.Labels[k] != v {
 			changed = true
+			break
 		}
 	}
-
 	if !changed {
 		return nil
 	}
 
-	return r.Patch(ctx, desired, client.MergeFrom(node))
+	patched := node.DeepCopy()
+	if patched.Labels == nil {
+		patched.Labels = make(map[string]string, len(desired))
+	}
+	maps.Copy(patched.Labels, desired)
+	return r.Patch(ctx, patched, client.MergeFrom(node))
 }
 
 func (r *NodeClaimReconciler) getLeaseHolderID() string {
 	if r.leaseHolderID != "" {
 		return r.leaseHolderID
 	}
-	if pod := os.Getenv("POD_NAME"); pod != "" {
-		r.leaseHolderID = pod
-		return pod
-	}
-	if host, err := os.Hostname(); err == nil {
-		r.leaseHolderID = host
-		return host
-	}
-	r.leaseHolderID = "kubenodesmith-controller"
+	host, _ := os.Hostname()
+	r.leaseHolderID = cmp.Or(os.Getenv("POD_NAME"), host, "kubenodesmith-controller")
 	return r.leaseHolderID
 }
 

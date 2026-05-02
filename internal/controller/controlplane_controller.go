@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 
@@ -259,7 +260,7 @@ func (r *ControlPlaneReconciler) mapPoolToControllers(ctx context.Context, pool 
 
 	requests := make([]reconcile.Request, 0, len(controllerList.Items))
 	for _, controllerObj := range controllerList.Items {
-		if contains(controllerObj.Spec.Pools, pool.Name) {
+		if slices.Contains(controllerObj.Spec.Pools, pool.Name) {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Namespace: controllerObj.Namespace,
@@ -297,7 +298,7 @@ func (r *ControlPlaneReconciler) mapProviderToControllers(ctx context.Context, p
 	requestSet := make(map[types.NamespacedName]struct{})
 	for _, controllerObj := range controllerList.Items {
 		for poolName := range poolNames {
-			if contains(controllerObj.Spec.Pools, poolName) {
+			if slices.Contains(controllerObj.Spec.Pools, poolName) {
 				requestSet[types.NamespacedName{
 					Namespace: controllerObj.Namespace,
 					Name:      controllerObj.Name,
@@ -323,13 +324,4 @@ func (r *ControlPlaneReconciler) mapProviderToControllers(ctx context.Context, p
 	}
 
 	return requests
-}
-
-func contains(values []string, target string) bool {
-	for _, v := range values {
-		if v == target {
-			return true
-		}
-	}
-	return false
 }
