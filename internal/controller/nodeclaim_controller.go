@@ -115,8 +115,13 @@ func (r *NodeClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		r.reconcileInitialization,
 	}
 	for _, phase := range phases {
-		if result, err := phase(ctx, &claim); result != nil || err != nil {
-			return *result, err
+		if result, err := phase(ctx, &claim); err != nil {
+			if result != nil {
+				return *result, err
+			}
+			return ctrl.Result{}, err
+		} else if result != nil {
+			return *result, nil
 		}
 	}
 
