@@ -11,10 +11,8 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -107,15 +105,8 @@ func GetClientset() (*kubernetes.Clientset, error) {
 	return kubernetes.NewForConfig(cfg)
 }
 
-// GetDynamicClient returns a dynamic client using the shared REST config.
-func GetDynamicClient() (dynamic.Interface, error) {
-	cfg, err := GetRESTConfig()
-	if err != nil {
-		return nil, err
-	}
-	return dynamic.NewForConfig(cfg)
-}
-
+// PrintNodes is a debug helper that prints a node list with Ready status.
+// Kept available for ad-hoc troubleshooting; safe to call from a Reconcile while diagnosing.
 func PrintNodes(nodes []corev1.Node) {
 	fmt.Printf("Total Candidate Nodes: %d\n", len(nodes))
 	fmt.Println("Nodes:")
@@ -128,6 +119,28 @@ func PrintNodes(nodes []corev1.Node) {
 			}
 		}
 		fmt.Printf("  - %s (%s)\n", node.Name, status)
+	}
+}
+
+// PrintPods is a debug helper that prints a pod list with node, phase, and unschedulable reason.
+// Kept available for ad-hoc troubleshooting.
+func PrintPods(pods []corev1.Pod) {
+	fmt.Printf("Found %d pods:\n", len(pods))
+	for _, p := range pods {
+		node := p.Spec.NodeName
+		if node == "" {
+			node = "<unassigned>"
+		}
+		phase := string(p.Status.Phase)
+		reason := ""
+		for _, c := range p.Status.Conditions {
+			if c.Type == corev1.PodScheduled && c.Status == corev1.ConditionFalse {
+				reason = c.Reason
+				break
+			}
+		}
+		fmt.Printf("  %-40s  ns=%-15s  node=%-20s  phase=%-10s  reason=%s\n",
+			p.Name, p.Namespace, node, phase, reason)
 	}
 }
 
@@ -182,31 +195,6 @@ func CordonNode(ctx context.Context, clientset *kubernetes.Clientset, nodeName s
 	return err
 }
 
-func PrintPods(pods []corev1.Pod) {
-	fmt.Printf("Found %d pods:\n", len(pods))
-	for _, p := range pods {
-		node := p.Spec.NodeName
-		if node == "" {
-			node = "<unassigned>"
-		}
-		phase := string(p.Status.Phase)
-		reason := ""
-		for _, c := range p.Status.Conditions {
-			if c.Type == corev1.PodScheduled && c.Status == corev1.ConditionFalse {
-				reason = c.Reason
-				break
-			}
-		}
-
-		fmt.Printf("  %-40s  ns=%-15s  node=%-20s  phase=%-10s  reason=%s\n",
-			p.Name, p.Namespace, node, phase, reason)
-	}
-}
-
-func isUnschedulable(condition corev1.PodCondition) bool {
-	return condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse && condition.Reason == corev1.PodReasonUnschedulable
-}
-
 func GetUnschedulablePods(ctx context.Context, clientset *kubernetes.Clientset) ([]corev1.Pod, error) {
 	podList, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{
 		FieldSelector: fields.AndSelectors(
@@ -226,7 +214,9 @@ func GetUnschedulablePods(ctx context.Context, clientset *kubernetes.Clientset) 
 			continue
 		}
 		for _, condition := range pod.Status.Conditions {
-			if isUnschedulable(condition) {
+			if condition.Type == corev1.PodScheduled &&
+				condition.Status == corev1.ConditionFalse &&
+				condition.Reason == corev1.PodReasonUnschedulable {
 				out = append(out, pod)
 			}
 		}
@@ -503,40 +493,4 @@ func LabelNode(ctx context.Context, clientset *kubernetes.Clientset, nodeName st
 
 	_, err = clientset.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
 	return err
-}
-
-func WaitForNodeReady(ctx context.Context, clientset *kubernetes.Clientset, nodeName string, timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("timeout waiting for node %s to be ready", nodeName)
-		case <-ticker.C:
-			node, err := clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
-			if err != nil {
-				// If node is not found, continue waiting - it might not be registered yet
-				if errors.IsNotFound(err) {
-					fmt.Printf("Node %s not found yet, continuing to wait...\n", nodeName)
-					continue
-				}
-				// For other errors, return immediately
-				return fmt.Errorf("error getting node %s: %v", nodeName, err)
-			}
-
-			// Check if node is ready
-			for _, condition := range node.Status.Conditions {
-				if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
-					fmt.Printf("Node %s is now ready!\n", nodeName)
-					return nil
-				}
-			}
-
-			fmt.Printf("Node %s exists but not ready yet, continuing to wait...\n", nodeName)
-		}
-	}
 }
