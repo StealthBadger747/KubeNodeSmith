@@ -218,6 +218,7 @@ func GetUnschedulablePods(ctx context.Context, clientset *kubernetes.Clientset) 
 				condition.Status == corev1.ConditionFalse &&
 				condition.Reason == corev1.PodReasonUnschedulable {
 				out = append(out, pod)
+				break
 			}
 		}
 
